@@ -1,6 +1,6 @@
 
 .DS_Store
 data/
-venv/
+venv/8
 __pycache__/
 *.pyc
