@@ -1,6 +1,21 @@
 
 .DS_Store
-data/
-venv/8
+data/*
+!data/searchThema/
+data/searchThema/*
+!data/searchThema/metadata/
+data/searchThema/metadata/*
+!data/searchThema/metadata/items/
+data/searchThema/metadata/items/*
+!data/searchThema/metadata/items/.gitkeep
+!data/searchThema/pdfs/
+data/searchThema/pdfs/*
+!data/searchThema/pdfs/.gitkeep
+!data/searchThema/state/
+data/searchThema/state/*
+!data/searchThema/state/.gitkeep
+scripts/spike_results.json
+*.tmp
+venv/
 __pycache__/
 *.pyc
