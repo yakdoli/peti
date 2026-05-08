@@ -16,6 +16,7 @@ data/searchThema/state/*
 !data/searchThema/state/.gitkeep
 scripts/spike_results.json
 *.tmp
+logs/
 venv/
 __pycache__/
 *.pyc
