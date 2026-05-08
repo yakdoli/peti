@@ -18,6 +18,23 @@ crawler:
       detail_url: "https://open.gwanbo.go.kr/OpenApi/web/commonApiWebDetail"
       viewer_base_url: "https://gwanbo.go.kr/"
       row_per_page: 10
+    searchThema:
+      tab_type: "1"
+      search_api_url: "https://gwanbo.go.kr/SearchRestApi.jsp"
+      theme_info_url: "https://gwanbo.go.kr/user/search/getThemeBaseInfo.do"
+      viewer_base_url: "https://gwanbo.go.kr/"
+      index: "gwanbo"
+      list_size: 10
+      year_start: 1994
+      year_end: "current"
+      institutions:
+        - "정부공직자윤리위원회"
+        - "대법원공직자윤리위원회"
+        - "중앙선거관리위원회공직자윤리위원회"
+      institution_query_map:
+        정부공직자윤리위원회: "정부공직자"
+        대법원공직자윤리위원회: "대법원"
+        중앙선거관리위원회공직자윤리위원회: "중앙선거관리위원회"
 
 # 재시작 상태 설정
 state:

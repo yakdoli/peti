@@ -35,6 +35,9 @@ class CrawlState:
     def is_window_completed(self, theme: str, start_date: str, end_date: str, mode: str = "pdf") -> bool:
         return self._window_key(theme, start_date, end_date, mode) in self.state.get("completed_windows", {})
 
+    def is_search_thema_completed(self, year: str, institution: str, mode: str) -> bool:
+        return self._search_thema_key(year, institution, mode) in self.state.get("completed_windows", {})
+
     def mark_window_completed(
         self,
         theme: str,
@@ -52,6 +55,12 @@ class CrawlState:
             "stats": stats,
             "completed_at": datetime.now().isoformat(),
         }
+        self.state["last_updated"] = datetime.now().isoformat()
+        self.save()
+
+    def mark_search_thema_completed(self, year: str, institution: str, mode: str, stats: Dict[str, Any]) -> None:
+        key = self._search_thema_key(year, institution, mode)
+        self.state.setdefault("completed_windows", {})[key] = stats
         self.state["last_updated"] = datetime.now().isoformat()
         self.save()
 
@@ -87,3 +96,7 @@ class CrawlState:
     @staticmethod
     def _window_key(theme: str, start_date: str, end_date: str, mode: str = "pdf") -> str:
         return f"{theme}:{mode}:{start_date}:{end_date}"
+
+    @staticmethod
+    def _search_thema_key(year: str, institution: str, mode: str) -> str:
+        return f"searchThema:{year}:{institution}:{mode}"

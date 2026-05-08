@@ -7,8 +7,12 @@ from datetime import datetime
 import pandas as pd
 import re
 
-from config import get_config
-from logger import setup_logger
+try:
+    from .config import get_config
+    from .logger import setup_logger
+except ImportError:
+    from config import get_config  # type: ignore[reportMissingImports]
+    from logger import setup_logger  # type: ignore[reportMissingImports]
 
 
 class MetadataManager:

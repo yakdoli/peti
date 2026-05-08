@@ -70,6 +70,10 @@ class Config:
         """크롤러 설정을 반환합니다."""
         return self.config.get('crawler', {})
 
+    def get_search_thema_config(self) -> Dict[str, Any]:
+        """searchThema 설정을 반환합니다."""
+        return self.config.get('crawler', {}).get('themes', {}).get('searchThema', {})
+
     def get_download_config(self) -> Dict[str, Any]:
         """다운로드 설정을 반환합니다."""
         return self.config.get('download', {})

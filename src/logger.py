@@ -2,7 +2,11 @@
 
 import logging
 from pathlib import Path
-from config import get_config
+
+try:
+    from .config import get_config
+except ImportError:
+    from config import get_config  # type: ignore[reportMissingImports]
 
 
 def setup_logger(name: str = "gwanbo_crawler") -> logging.Logger:
