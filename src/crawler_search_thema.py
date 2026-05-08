@@ -137,7 +137,11 @@ class SearchThemaCrawler(BaseCrawler):
                     if self._should_skip_combination(year, institution):
                         continue
 
-                    combination_stats = await self._crawl_combination(context, year, institution)
+                    try:
+                        combination_stats = await self._crawl_combination(context, year, institution)
+                    except Exception as exc:
+                        self.logger.error(f"조합 수집 실패 {year}/{institution}: {exc}")
+                        combination_stats = {"year": str(year), "institution": self._institution_state_value(institution), "error": str(exc)}
                     if not self._limit_reached and self.limit is None:
                         self.state.mark_search_thema_completed(
                             str(year),

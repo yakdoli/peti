@@ -78,8 +78,14 @@ def _parse_item(item: Dict[str, Any]) -> SearchThemaItem:
 
 def _normalize_date(year: str, month: str, day: str, fallback: str = "") -> str:
     text = f"{year}{month}{day}"
-    if len(text) == 8 and text.isdigit():
-        return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
-    if len(fallback) == 8 and fallback.isdigit():
-        return datetime.strptime(fallback, "%Y%m%d").strftime("%Y-%m-%d")
+    try:
+        if len(text) == 8 and text.isdigit():
+            return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
+    except (ValueError, OverflowError):
+        pass
+    try:
+        if len(fallback) == 8 and fallback.isdigit():
+            return datetime.strptime(fallback, "%Y%m%d").strftime("%Y-%m-%d")
+    except (ValueError, OverflowError):
+        pass
     return text or fallback
