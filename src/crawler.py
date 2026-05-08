@@ -3,38 +3,36 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin
-
-import aiohttp
 
 try:
-    from playwright.async_api import BrowserContext, async_playwright
+    from playwright.async_api import BrowserContext, async_playwright  # type: ignore[reportMissingImports]
 
     HAS_PLAYWRIGHT = True
 except ImportError:
     BrowserContext = Any
+    async_playwright = None
     HAS_PLAYWRIGHT = False
 
 try:
+    from .base_crawler import BaseCrawler
     from .config import get_config
     from .crawl_state import CrawlState
     from .logger import setup_logger
     from .metadata_manager import MetadataManager
     from .pety_parser import parse_pety_list_page
 except ImportError:
-    from config import get_config
-    from crawl_state import CrawlState
-    from logger import setup_logger
-    from metadata_manager import MetadataManager
-    from pety_parser import parse_pety_list_page
+    from base_crawler import BaseCrawler  # type: ignore[reportMissingImports]
+    from config import get_config  # type: ignore[reportMissingImports]
+    from crawl_state import CrawlState  # type: ignore[reportMissingImports]
+    from logger import setup_logger  # type: ignore[reportMissingImports]
+    from metadata_manager import MetadataManager  # type: ignore[reportMissingImports]
+    from pety_parser import parse_pety_list_page  # type: ignore[reportMissingImports]
 
 
-class GwanboCrawler:
+class GwanboCrawler(BaseCrawler):
     """Collect petyList metadata and PDFs using a Playwright browser context."""
 
     def __init__(
@@ -114,6 +112,12 @@ class GwanboCrawler:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return None
 
+    async def fetch_items(self, page_number: int) -> List[Dict[str, Any]]:
+        raise NotImplementedError("GwanboCrawler는 날짜 윈도우 컨텍스트에서 항목을 조회합니다.")
+
+    def get_item_id(self, item: Dict[str, Any]) -> str:
+        return str(item["id"])
+
     async def crawl(self) -> Dict[str, Any]:
         """Run the full crawl."""
         self.stats["start_time"] = datetime.now()
@@ -123,6 +127,7 @@ class GwanboCrawler:
         self.logger.info("=" * 60)
 
         try:
+            assert async_playwright is not None
             async with async_playwright() as playwright:
                 browser = await self._launch_browser(playwright)
                 context = await browser.new_context(
@@ -181,7 +186,7 @@ class GwanboCrawler:
         self.logger.info("=" * 60)
         return self._get_statistics()
 
-    async def _prime_browser_session(self, context: BrowserContext) -> None:
+    async def _prime_browser_session(self, context: Any) -> None:
         page = await context.new_page()
         try:
             await page.goto(self.list_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
@@ -210,7 +215,7 @@ class GwanboCrawler:
 
     async def _crawl_window(
         self,
-        context: BrowserContext,
+        context: Any,
         window_start: datetime,
         window_end: datetime,
     ) -> Dict[str, Any]:
@@ -257,7 +262,7 @@ class GwanboCrawler:
 
     async def _fetch_list_page(
         self,
-        context: BrowserContext,
+        context: Any,
         start_date: datetime,
         end_date: datetime,
         page_number: int,
@@ -290,19 +295,19 @@ class GwanboCrawler:
                 await asyncio.sleep(self.retry_delay)
         raise RuntimeError(f"목록 요청 실패: {last_error}")
 
-    async def _process_item(self, context: BrowserContext, item: Dict[str, Any]) -> bool:
+    async def _process_item(self, context: Any, item: Dict[str, Any]) -> bool:
         if self.limit is not None and self.stats["total_items"] >= self.limit:
             self._limit_reached = True
             return False
 
         self.stats["total_items"] += 1
-        item["ocr"]["ready_dir"] = str(self.ocr_ready_dir / self._safe_filename(item["id"]))
+        item["ocr"]["ready_dir"] = str(self.ocr_ready_dir / self._safe_filename(self.get_item_id(item)))
 
-        existing = self.metadata_manager.get_item(item["id"])
+        existing = self.metadata_manager.get_item(self.get_item_id(item))
         if self.resume and existing and self._existing_pdf_is_complete(existing):
             self.metadata_manager.add_item(existing)
             self.stats["skipped_items"] += 1
-            self.logger.debug(f"이미 완료된 항목 건너뜀: {item['id']}")
+            self.logger.debug(f"이미 완료된 항목 건너뜀: {self.get_item_id(item)}")
             return True
 
         if self.download_pdfs:
@@ -316,132 +321,6 @@ class GwanboCrawler:
         self.stats["saved_items"] += 1
         return True
 
-    async def _download_item_pdf(self, context: BrowserContext, item: Dict[str, Any]) -> Dict[str, Any]:
-        last_error: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                result = await self._download_item_pdf_once(context, item)
-                if attempt > 1:
-                    self.logger.info(f"PDF 다운로드 재시도 성공 ({item.get('id')}): {attempt}/{self.max_retries}")
-                return result
-            except Exception as e:
-                last_error = e
-                if attempt < self.max_retries:
-                    self.logger.warning(
-                        f"PDF 다운로드 재시도 {attempt}/{self.max_retries} ({item.get('id')}): {e}"
-                    )
-                    await asyncio.sleep(self.retry_delay * attempt)
-
-        item["pdf"]["status"] = "failed"
-        item["pdf"]["error"] = str(last_error)
-        item["status"] = "download_failed"
-        self.stats["failed_downloads"] += 1
-        self.logger.warning(f"PDF 다운로드 실패 ({item.get('id')}): {last_error}")
-        return item
-
-    async def _download_item_pdf_once(self, context: BrowserContext, item: Dict[str, Any]) -> Dict[str, Any]:
-        viewer_path = item.get("viewer_path", "")
-        if not viewer_path:
-            raise RuntimeError("viewer_path가 없습니다.")
-
-        viewer_url = self._viewer_url_for_item(item, viewer_path)
-        viewer_response = await context.request.get(viewer_url, timeout=self.timeout_ms)
-        if viewer_response.status != 200:
-            raise RuntimeError(f"뷰어 요청 실패: HTTP {viewer_response.status}")
-        viewer_html = await viewer_response.text()
-
-        download_url, form_data = self._extract_download_request(viewer_html, item)
-        pdf_path = self._pdf_path_for_item(item)
-        pdf_path.parent.mkdir(parents=True, exist_ok=True)
-
-        result = await self._download_pdf_stream(context, download_url, form_data, pdf_path)
-        item["pdf"].update(result)
-        item["status"] = "completed"
-        self.stats["downloaded_pdfs"] += 1
-        self.logger.info(f"PDF 다운로드 완료: {pdf_path}")
-        return item
-
-    def _viewer_url_for_item(self, item: Dict[str, Any], viewer_path: str) -> str:
-        content_id = item.get("content_id")
-        toc_id = item.get("toc_id")
-        if content_id and toc_id:
-            return urljoin(
-                self.viewer_base_url,
-                f"ezpdf/customLayout.jsp?contentId={content_id}&tocId={toc_id}&isTocOrder=N",
-            )
-        return urljoin(self.viewer_base_url, viewer_path.lstrip("/"))
-
-    def _extract_download_request(self, viewer_html: str, item: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
-        content_match = re.search(
-            r"(/user/common/ofcttCntntDownload\.do(?:;jsessionid=[A-Za-z0-9_.-]+)?)",
-            viewer_html,
-        )
-        if content_match and item.get("toc_id"):
-            return urljoin(self.viewer_base_url, content_match.group(1)), {"cntnt_seq_no": item["toc_id"]}
-
-        issue_match = re.search(
-            r"(/user/common/ofcttDownload\.do(?:;jsessionid=[A-Za-z0-9_.-]+)?)",
-            viewer_html,
-        )
-        if issue_match and item.get("content_id"):
-            return urljoin(self.viewer_base_url, issue_match.group(1)), {
-                "downType": "1",
-                "ofctt_seq_no": item["content_id"],
-            }
-
-        raise RuntimeError("PDF 다운로드 엔드포인트를 찾을 수 없습니다.")
-
-    async def _download_pdf_stream(
-        self,
-        context: BrowserContext,
-        download_url: str,
-        form_data: Dict[str, str],
-        pdf_path: Path,
-    ) -> Dict[str, Any]:
-        cookies = await context.cookies(self.viewer_base_url)
-        cookie_header = "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in cookies)
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Referer": self.viewer_base_url,
-        }
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-
-        temp_path = pdf_path.with_suffix(".pdf.tmp")
-        sha256 = hashlib.sha256()
-        size = 0
-
-        timeout = aiohttp.ClientTimeout(total=max(self.request_timeout, 60))
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.post(download_url, data=form_data) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"PDF 요청 실패: HTTP {response.status}")
-                with open(temp_path, "wb") as f:
-                    async for chunk in response.content.iter_chunked(self.chunk_size):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        sha256.update(chunk)
-                        size += len(chunk)
-
-        with open(temp_path, "rb") as f:
-            header = f.read(5)
-        if header != b"%PDF-":
-            temp_path.unlink(missing_ok=True)
-            raise RuntimeError("다운로드 결과가 PDF가 아닙니다.")
-
-        temp_path.replace(pdf_path)
-        return {
-            "status": "completed",
-            "path": str(pdf_path),
-            "size_bytes": size,
-            "sha256": sha256.hexdigest(),
-            "downloaded_at": datetime.now().isoformat(),
-        }
-
     def _date_windows(self) -> Iterable[Tuple[datetime, datetime]]:
         current = self.start_date
         while current <= self.end_date:
@@ -449,44 +328,8 @@ class GwanboCrawler:
             yield current, window_end
             current = window_end + timedelta(days=1)
 
-    def _pdf_path_for_item(self, item: Dict[str, Any]) -> Path:
-        date_text = item.get("date", "unknown")
-        year = date_text[:4] if re.match(r"^\d{4}", date_text) else "unknown"
-        date_key = date_text.replace("-", "") if re.match(r"^\d{4}-\d{2}-\d{2}$", date_text) else "unknown"
-        return self.pdf_dir / year / date_key / f"{self._safe_filename(item['id'])}.pdf"
-
-    def _existing_pdf_is_complete(self, item: Dict[str, Any]) -> bool:
-        pdf = item.get("pdf", {}) or {}
-        path = Path(str(pdf.get("path", "")))
-        return pdf.get("status") == "completed" and path.exists() and path.stat().st_size > 0
-
-    def _parse_date(self, date_text: str) -> datetime:
-        text = (date_text or "").strip()
-        if text.lower() == "today":
-            return datetime.now()
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y.%m.%d"):
-            try:
-                return datetime.strptime(text, fmt)
-            except ValueError:
-                continue
-        raise ValueError(f"날짜 형식을 파싱할 수 없습니다: {date_text}")
-
-    def _get_statistics(self) -> Dict[str, Any]:
-        duration = (
-            self.stats["end_time"] - self.stats["start_time"]
-        ).total_seconds() if self.stats["end_time"] and self.stats["start_time"] else 0
-        result = dict(self.stats)
-        result["duration_seconds"] = duration
-        result["start_time"] = self.stats["start_time"].isoformat() if self.stats["start_time"] else None
-        result["end_time"] = self.stats["end_time"].isoformat() if self.stats["end_time"] else None
-        return result
-
     def _state_mode(self) -> str:
         return "metadata" if self.metadata_only else "pdf"
-
-    @staticmethod
-    def _safe_filename(value: str) -> str:
-        return re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", str(value)).strip("._") or "unknown"
 
     @staticmethod
     def _system_browser_candidates() -> List[Path]:
