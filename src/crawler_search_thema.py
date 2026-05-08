@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import json
 from datetime import datetime
@@ -70,6 +71,7 @@ class SearchThemaCrawler(BaseCrawler):
         save_indexes: bool = True,
         state_file: str | None = None,
         headless: bool = True,
+        concurrency: int = 5,
     ):
         super().__init__()
 
@@ -87,6 +89,7 @@ class SearchThemaCrawler(BaseCrawler):
         self.limit = limit
         self.save_indexes = save_indexes
         self.headless = headless
+        self.concurrency = concurrency
         self._limit_reached = False
         self.search_api_url = search_config.get("search_api_url", "https://gwanbo.go.kr/SearchRestApi.jsp")
         self.theme_info_url = search_config.get("theme_info_url", "https://gwanbo.go.kr/user/search/getThemeBaseInfo.do")
@@ -182,20 +185,56 @@ class SearchThemaCrawler(BaseCrawler):
                 break
             combination_stats["pages"] += 1
 
+            # Phase 1: Prepare and skip-check (fast, sequential)
+            to_process: List[Dict[str, Any]] = []
+            to_download: List[Dict[str, Any]] = []
             for item in items:
                 if self._limit_reached:
                     break
-                before_saved = self.stats["saved_items"]
-                before_skipped = self.stats["skipped_items"]
-                before_downloaded = self.stats["downloaded_pdfs"]
-                before_failed = self.stats["failed_downloads"]
-                processed = await self._process_item(context, item)
-                if processed:
-                    combination_stats["items"] += 1
-                    combination_stats["saved_items"] += self.stats["saved_items"] - before_saved
-                    combination_stats["skipped_items"] += self.stats["skipped_items"] - before_skipped
-                    combination_stats["downloaded_pdfs"] += self.stats["downloaded_pdfs"] - before_downloaded
-                    combination_stats["failed_downloads"] += self.stats["failed_downloads"] - before_failed
+                prepared = self._metadata_item_from_raw(item)
+                combination_stats["items"] += 1
+                self.stats["total_items"] += 1
+                if self._should_skip_item(prepared):
+                    combination_stats["skipped_items"] += 1
+                    continue
+                if self.download_pdfs:
+                    to_download.append(prepared)
+                else:
+                    prepared["status"] = "metadata_only"
+                    prepared["pdf"]["status"] = "skipped"
+                    prepared["updated_at"] = datetime.now().isoformat()
+                    self.metadata_manager.save_item(prepared)
+                    self.stats["saved_items"] += 1
+                    combination_stats["saved_items"] += 1
+
+            # Phase 2: Concurrent PDF downloads
+            if to_download:
+                sem = asyncio.Semaphore(self.concurrency)
+
+                async def _download_one(itm: Dict[str, Any]) -> Dict[str, Any]:
+                    async with sem:
+                        return await self._download_item_pdf(context, itm)
+
+                results = await asyncio.gather(
+                    *[_download_one(itm) for itm in to_download],
+                    return_exceptions=True,
+                )
+                for _i, result in enumerate(results):
+                    item_ref = to_download[_i]
+                    if isinstance(result, BaseException):
+                        item_ref["pdf"]["status"] = "failed"
+                        item_ref["pdf"]["error"] = str(result)
+                        item_ref["status"] = "download_failed"
+                        self.stats["failed_downloads"] += 1
+                        combination_stats["failed_downloads"] += 1
+                    elif isinstance(result, dict):
+                        item_ref.update(result)
+                        self.stats["downloaded_pdfs"] += 1
+                        combination_stats["downloaded_pdfs"] += 1
+                    item_ref["updated_at"] = datetime.now().isoformat()
+                    self.metadata_manager.save_item(item_ref)
+                    self.stats["saved_items"] += 1
+                    combination_stats["saved_items"] += 1
 
             page_number += 1
             await self._sleep(0.2)

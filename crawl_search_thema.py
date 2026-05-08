@@ -28,6 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--headed", action="store_true", help="Playwright fallback 사용 시 브라우저를 headless=false로 실행합니다.")
     parser.add_argument("--rebuild-index", action="store_true", help="SearchThema 항목별 JSON에서 aggregate 인덱스를 재생성합니다.")
     parser.add_argument("--state-file", help="재시작 상태 파일 경로")
+    parser.add_argument("--concurrency", type=int, default=5, help="동시 다운로드 수 (기본: 5)")
     return parser.parse_args(argv)
 
 
@@ -66,6 +67,7 @@ async def run_crawler(args: argparse.Namespace) -> Optional[dict]:
         institutions=institutions,
         state_file=args.state_file,
         headless=not args.headed,
+        concurrency=args.concurrency,
     )
     stats = await crawler.crawl()
 
