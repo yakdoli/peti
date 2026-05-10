@@ -73,6 +73,10 @@ class HFUploader:
         """컨테이너/프록시 환경에서 Xet CAS 경로를 우회하기 위해 기본 비활성화."""
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
+    @staticmethod
+    def _is_repo_not_found_error(error: Exception) -> bool:
+        return "404" in str(error) or "not found" in str(error).lower()
+
     def ensure_repo(self, private: bool = False, exist_ok: bool = True, dry_run: bool = False) -> bool:
         """HF dataset repository 생성/검증."""
         if dry_run:
@@ -86,6 +90,17 @@ class HFUploader:
             return False
         try:
             api = HfApi(token=self.hf_token)
+            try:
+                info = api.repo_info(repo_id=self.repo_id, repo_type="dataset", token=self.hf_token)
+                logger.info(
+                    "기존 dataset 리포지터리 감지: %s (private=%s) - 기존 공개/비공개 설정을 유지합니다.",
+                    self.repo_id,
+                    getattr(info, "private", "unknown"),
+                )
+                return True
+            except Exception as repo_info_error:
+                if not self._is_repo_not_found_error(repo_info_error):
+                    logger.warning(f"리포지터리 조회 실패, 생성 시도 진행: {repo_info_error}")
             api.create_repo(
                 repo_id=self.repo_id,
                 repo_type="dataset",
@@ -112,6 +127,17 @@ class HFUploader:
             return False
         try:
             api = HfApi(token=self.hf_token)
+            try:
+                info = api.bucket_info(bucket_id=bucket_id, token=self.hf_token)
+                logger.info(
+                    "기존 bucket 감지: %s (private=%s) - 기존 공개/비공개 설정을 유지합니다.",
+                    bucket_id,
+                    getattr(info, "private", "unknown"),
+                )
+                return True
+            except Exception as bucket_info_error:
+                if not self._is_repo_not_found_error(bucket_info_error):
+                    logger.warning(f"bucket 조회 실패, 생성 시도 진행: {bucket_info_error}")
             api.create_bucket(
                 bucket_id=bucket_id,
                 private=private,
@@ -171,7 +197,8 @@ class HFUploader:
             return True
         try:
             api = HfApi(token=self.hf_token)
-            api.create_repo(repo_id=self.repo_id, repo_type="dataset", private=False, exist_ok=True, token=self.hf_token)
+            if not self.ensure_repo(dry_run=False):
+                return False
             commit_info = api.upload_folder(
                 repo_id=self.repo_id,
                 repo_type="dataset",
@@ -349,7 +376,6 @@ class HFUploader:
                 repo_id=self.repo_id,
                 config_name=config_name,
                 split="main",
-                private=False,
                 token=self.hf_token,
             )
             logger.info(f"HF 업로드 완료: {config_name}")
