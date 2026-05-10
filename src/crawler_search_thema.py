@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -108,7 +109,8 @@ class SearchThemaCrawler(BaseCrawler):
         self.pety_list_url = search_config.get("pety_list_url", "https://open.gwanbo.go.kr/OpenApi/web/petyList")
         self.enable_pety_html_fallback = bool(search_config.get("enable_pety_html_fallback", False))
         self.search_index = str(search_config.get("index", "gwanbo"))
-        self.list_size = int(search_config.get("list_size", 10))
+        self.list_size = int(os.getenv("SEARCH_LIST_SIZE", search_config.get("list_size", 10)))
+        self.page_delay = float(os.getenv("SEARCH_PAGE_DELAY", "0.2"))
         self.institution_query_map = dict(search_config.get("institution_query_map", {}))
         self.years = [str(year) for year in years] if years is not None else self._configured_years(search_config)
         self.institutions = list(institutions) if institutions is not None else self._configured_institutions(search_config)
@@ -281,7 +283,8 @@ class SearchThemaCrawler(BaseCrawler):
                     combination_stats["saved_items"] += 1
 
             page_number += 1
-            await self._sleep(0.2)
+            if self.page_delay > 0:
+                await self._sleep(self.page_delay)
 
         return combination_stats
 

@@ -164,3 +164,24 @@ def test_extract_text_pdf_metadata_handles_invalid_file(tmp_path: Path) -> None:
 
     assert result["text_extractable"] is False
     assert "error" in result
+
+
+def test_extract_text_pdf_metadata_handles_reader_page_errors(tmp_path: Path, monkeypatch) -> None:
+    crawler = DummyCrawler(tmp_path)
+    pdf_path = tmp_path / "xref_weird.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 dummy")
+
+    class BrokenReader:
+        metadata = {}
+
+        @property
+        def pages(self):
+            raise ValueError("invalid literal for int() with base 16: b'\\t'")
+
+    monkeypatch.setattr("src.base_crawler.PdfReader", lambda _path: BrokenReader())
+
+    result = crawler._extract_text_pdf_metadata(pdf_path)
+
+    assert result["text_extractable"] is False
+    assert result["pages"] == 0
+    assert "invalid literal" in result["error"]

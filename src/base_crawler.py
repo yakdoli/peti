@@ -161,9 +161,9 @@ class BaseCrawler(ABC):
                     raise RuntimeError(f"뷰어 요청 실패: HTTP {viewer_response.status}")
                 viewer_html = await viewer_response.text()
             except Exception as request_error:
-                if "ENETUNREACH" not in str(request_error):
+                if not self._should_fallback_pdf_http_error(request_error):
                     raise
-                self.logger.warning("PDF 뷰어 요청 ENETUNREACH 감지, 브라우저 페이지 fallback 시도")
+                self.logger.warning(f"PDF 뷰어 요청 실패, 브라우저 페이지 fallback 시도: {request_error}")
                 viewer_html = await self._fetch_viewer_html_via_browser_page(context, viewer_url)
 
         download_url, form_data = self._extract_download_request(viewer_html, item)
@@ -202,20 +202,42 @@ class BaseCrawler(ABC):
 
         text_pages = 0
         total_chars = 0
-        for page in reader.pages:
-            text = (page.extract_text() or "").strip()
+        page_count = 0
+        page_errors: List[Dict[str, Any]] = []
+        try:
+            pages = list(reader.pages)
+            page_count = len(pages)
+        except Exception as e:
+            return {
+                "text_extractable": False,
+                "pages": 0,
+                "text_pages": 0,
+                "total_chars": 0,
+                "error": str(e),
+                "generated_at": datetime.now().isoformat(),
+            }
+
+        for page_number, page in enumerate(pages, start=1):
+            try:
+                text = (page.extract_text() or "").strip()
+            except Exception as e:
+                page_errors.append({"page": page_number, "error": str(e)})
+                continue
             if text:
                 text_pages += 1
                 total_chars += len(text)
 
-        return {
+        result = {
             "text_extractable": text_pages > 0,
-            "pages": len(reader.pages),
+            "pages": page_count,
             "text_pages": text_pages,
             "total_chars": total_chars,
             "pdf_metadata": {k: str(v) for k, v in (reader.metadata or {}).items()},
             "generated_at": datetime.now().isoformat(),
         }
+        if page_errors:
+            result["page_errors"] = page_errors
+        return result
     async def _fetch_viewer_html_via_browser_page(self, context: Any, viewer_url: str) -> str:
         page = await context.new_page()
         try:
@@ -325,11 +347,11 @@ class BaseCrawler(ABC):
                                 sha256.update(chunk)
                                 size += len(chunk)
             except Exception as http_error:
-                if "Network is unreachable" not in str(http_error) and "ENETUNREACH" not in str(http_error):
+                if not self._should_fallback_pdf_http_error(http_error):
                     raise
-                self.logger.warning("PDF aiohttp 다운로드 ENETUNREACH 감지, APIRequestContext fallback 시도")
+                self.logger.warning(f"PDF aiohttp 다운로드 실패, APIRequestContext fallback 시도: {http_error}")
                 if not hasattr(context, "request"):
-                    raise RuntimeError(f"PDF HTTP 다운로드 실패(ENETUNREACH) 및 fallback 불가: {http_error}") from http_error
+                    raise RuntimeError(f"PDF HTTP 다운로드 실패 및 fallback 불가: {http_error}") from http_error
                 await self._throttle_network()
                 response = await context.request.post(download_url, form=form_data, timeout=self.timeout_ms)
                 if response.status != 200:
@@ -354,6 +376,23 @@ class BaseCrawler(ABC):
             "sha256": sha256.hexdigest(),
             "downloaded_at": datetime.now().isoformat(),
         }
+
+    @staticmethod
+    def _should_fallback_pdf_http_error(error: Exception) -> bool:
+        """Return true for flaky/invalid HTTP transfer errors from gwanbo PDF responses."""
+        text = str(error)
+        transient_markers = (
+            "Network is unreachable",
+            "ENETUNREACH",
+            "Connection reset by peer",
+            "socket hang up",
+            "ContentLengthError",
+            "TransferEncodingError",
+            "Not enough data to satisfy",
+            "Not enough data for satisfy transfer length",
+            "invalid literal for int() with base 16",
+        )
+        return any(marker in text for marker in transient_markers)
 
     async def _download_pdf_body_via_browser_page(
         self,
@@ -399,6 +438,8 @@ class BaseCrawler(ABC):
             await page.close()
 
     async def _is_host_reachable(self, host: str, port: int) -> bool:
+        if os.getenv("GWANBO_ASSUME_HOST_REACHABLE", "").lower() in {"1", "true", "yes"}:
+            return True
         if not hasattr(self, "_connectivity_cache"):
             self._connectivity_cache = {}
         cache_key = f"{host}:{port}"
