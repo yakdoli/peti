@@ -18,11 +18,12 @@ except ImportError:
 class MetadataManager:
     """메타데이터 관리 클래스"""
 
-    def __init__(self):
+    def __init__(self, metadata_dir: str | Path | None = None):
         """메타데이터 매니저를 초기화합니다."""
         self.config = get_config()
         self.logger = setup_logger(__name__)
-        self.metadata_dir = Path(self.config.get_download_config().get('metadata_directory', 'artifacts/metadata'))
+        default_metadata_dir = self.config.get_download_config().get('metadata_directory', 'artifacts/metadata')
+        self.metadata_dir = Path(metadata_dir or default_metadata_dir)
         self.items_dir = self.metadata_dir / 'items'
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
         self.items_dir.mkdir(parents=True, exist_ok=True)

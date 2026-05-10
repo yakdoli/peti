@@ -56,12 +56,12 @@ class GwanboCrawler(BaseCrawler):
 
         self.config = get_config()
         self.logger = setup_logger(__name__)
-        self.metadata_manager = MetadataManager()
-        self.state = CrawlState(state_file or self.config.get("state.file", "artifacts/state/crawl_state.json"))
 
         crawler_config = self.config.get_crawler_config()
         download_config = self.config.get_download_config()
         theme_config = crawler_config.get("themes", {}).get(theme, {})
+        self.metadata_manager = MetadataManager(self._pety_metadata_dir(download_config.get("metadata_directory", "artifacts/metadata")))
+        self.state = CrawlState(state_file or self._pety_state_file(self.config.get("state.file", "artifacts/state/crawl_state.json")))
 
         self.theme = theme
         self.start_date = self._parse_date(start_date or crawler_config.get("start_date", "1994-01-01"))
@@ -88,8 +88,8 @@ class GwanboCrawler(BaseCrawler):
         self.request_timeout = int(crawler_config.get("timeout", 30))
         self.retry_delay = float(crawler_config.get("retry_delay", 2))
         self.max_retries = int(crawler_config.get("max_retries", 3))
-        self.pdf_dir = Path(download_config.get("pdf_directory", "artifacts/pdfs"))
-        self.ocr_ready_dir = Path(download_config.get("ocr_ready_directory", "artifacts/ocr_ready"))
+        self.pdf_dir = self._pety_pdf_dir(download_config.get("pdf_directory", "artifacts/pdfs"))
+        self.ocr_ready_dir = self._pety_ocr_ready_dir(download_config.get("ocr_ready_directory", "artifacts/ocr_ready"))
         self.chunk_size = int(download_config.get("chunk_size", 8192))
 
         self.stats: Dict[str, Any] = {
@@ -106,6 +106,34 @@ class GwanboCrawler(BaseCrawler):
             "end_time": None,
         }
         self._limit_reached = False
+
+    @staticmethod
+    def _source_dir(path_text: str, leaf_name: str, source: str = "pety") -> Path:
+        path = Path(path_text)
+        if source in path.parts:
+            return path
+        if path.name == leaf_name:
+            return path.parent / source / leaf_name
+        return path / source / leaf_name
+
+    @classmethod
+    def _pety_metadata_dir(cls, metadata_directory: str) -> Path:
+        return cls._source_dir(metadata_directory, "metadata")
+
+    @classmethod
+    def _pety_pdf_dir(cls, pdf_directory: str) -> Path:
+        return cls._source_dir(pdf_directory, "pdfs")
+
+    @classmethod
+    def _pety_ocr_ready_dir(cls, ocr_ready_directory: str) -> Path:
+        return cls._source_dir(ocr_ready_directory, "ocr_ready")
+
+    @staticmethod
+    def _pety_state_file(state_file: str) -> str:
+        path = Path(state_file)
+        if "pety" in path.parts:
+            return str(path)
+        return str(path.parent / "pety" / path.name)
 
     async def __aenter__(self):
         return self
@@ -191,6 +219,7 @@ class GwanboCrawler(BaseCrawler):
     async def _prime_browser_session(self, context: Any) -> None:
         page = await context.new_page()
         try:
+            await self._throttle_network()
             await page.goto(self.list_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         finally:
             await page.close()
@@ -283,6 +312,7 @@ class GwanboCrawler(BaseCrawler):
         for attempt in range(1, self.max_retries + 1):
             try:
                 try:
+                    await self._throttle_network()
                     response = await context.request.post(
                         self.ajax_url,
                         form=form,
@@ -306,6 +336,7 @@ class GwanboCrawler(BaseCrawler):
     async def _fetch_list_page_via_browser_page(self, context: Any, form: Dict[str, str]) -> str:
         page = await context.new_page()
         try:
+            await self._throttle_network()
             await page.goto(self.list_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             result = await page.evaluate(
                 """async ({ url, formData }) => {

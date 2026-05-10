@@ -6,6 +6,8 @@ crawler:
   timeout: 30
   max_retries: 3
   retry_delay: 2
+  request_min_interval: 0.2
+  request_jitter: 0.05
   window_days: 31
   row_per_page: 10
   headless: true
@@ -43,9 +45,9 @@ state:
 
 # 다운로드 설정
 download:
-  pdf_directory: "artifacts/pdfs"
-  metadata_directory: "artifacts/metadata"
-  ocr_ready_directory: "artifacts/ocr_ready"
+  pdf_directory: "artifacts"
+  metadata_directory: "artifacts"
+  ocr_ready_directory: "artifacts"
   chunk_size: 8192
   max_concurrent_downloads: 5
 

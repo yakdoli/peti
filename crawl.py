@@ -12,6 +12,7 @@ from entrypoint_utils import add_project_paths, configure_windows_asyncio_policy
 add_project_paths()
 
 from src.crawler import GwanboCrawler
+from src.config import get_config
 from src.logger import setup_logger
 from src.metadata_manager import MetadataManager
 
@@ -39,7 +40,12 @@ async def run_crawler(args: argparse.Namespace) -> Optional[dict]:
     logger = setup_logger(__name__)
 
     if args.rebuild_index:
-        manager = MetadataManager()
+        config = get_config()
+        manager = MetadataManager(
+            GwanboCrawler._pety_metadata_dir(
+                config.get_download_config().get("metadata_directory", "artifacts/metadata")
+            )
+        )
         manager.rebuild_indexes()
         logger.info("메타데이터 인덱스 재생성 완료")
         return None

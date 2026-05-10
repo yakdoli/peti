@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import fcntl
+import os
+import random
 import re
 import socket
+import time
 from PyPDF2 import PdfReader
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -54,6 +58,53 @@ class BaseCrawler(ABC):
     chunk_size: int
     _connectivity_cache: Dict[str, bool]
 
+    async def _throttle_network(self) -> None:
+        """Apply a small cross-process delay before hitting the Gwanbo host."""
+        crawler_config = getattr(getattr(self, "config", None), "get_crawler_config", lambda: {})()
+        min_interval = float(
+            os.getenv(
+                "GWANBO_REQUEST_MIN_INTERVAL",
+                crawler_config.get("request_min_interval", 0.2),
+            )
+        )
+        jitter = float(
+            os.getenv(
+                "GWANBO_REQUEST_JITTER",
+                crawler_config.get("request_jitter", 0.05),
+            )
+        )
+        if min_interval <= 0 and jitter <= 0:
+            return
+
+        lock_dir = Path(os.getenv("GWANBO_THROTTLE_DIR", "artifacts/state/network"))
+        await asyncio.to_thread(self._throttle_network_sync, lock_dir, min_interval, jitter)
+
+    @staticmethod
+    def _throttle_network_sync(lock_dir: Path, min_interval: float, jitter: float) -> None:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "gwanbo.lock"
+        stamp_path = lock_dir / "gwanbo.last"
+        with open(lock_path, "w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                last = 0.0
+                if stamp_path.exists():
+                    try:
+                        last = float(stamp_path.read_text(encoding="utf-8").strip() or "0")
+                    except ValueError:
+                        last = 0.0
+
+                now = time.monotonic()
+                delay = max(0.0, min_interval - (now - last))
+                if jitter > 0:
+                    delay += random.uniform(0, jitter)
+                if delay > 0:
+                    time.sleep(delay)
+
+                stamp_path.write_text(str(time.monotonic()), encoding="utf-8")
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     @abstractmethod
     async def fetch_items(self, page_number: int) -> List[Dict[str, Any]]:
         """Fetch a page of source items."""
@@ -70,6 +121,7 @@ class BaseCrawler(ABC):
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
+                await self._throttle_network()
                 result = await self._download_item_pdf_once(context, item)
                 if attempt > 1:
                     self.logger.info(
@@ -103,6 +155,7 @@ class BaseCrawler(ABC):
             viewer_html = await self._fetch_viewer_html_via_browser_page(context, viewer_url)
         else:
             try:
+                await self._throttle_network()
                 viewer_response = await context.request.get(viewer_url, timeout=self.timeout_ms)
                 if viewer_response.status != 200:
                     raise RuntimeError(f"뷰어 요청 실패: HTTP {viewer_response.status}")
@@ -166,6 +219,7 @@ class BaseCrawler(ABC):
     async def _fetch_viewer_html_via_browser_page(self, context: Any, viewer_url: str) -> str:
         page = await context.new_page()
         try:
+            await self._throttle_network()
             response = await page.goto(viewer_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             if response is not None and response.status >= 400:
                 raise RuntimeError(f"뷰어 요청 실패(브라우저): HTTP {response.status}")
@@ -188,6 +242,7 @@ class BaseCrawler(ABC):
 
         timeout = aiohttp.ClientTimeout(total=max(self.request_timeout, 60))
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            await self._throttle_network()
             async with session.get(viewer_url) as response:
                 if response.status != 200:
                     raise RuntimeError(f"뷰어 요청 실패(aiohttp): HTTP {response.status}")
@@ -258,6 +313,7 @@ class BaseCrawler(ABC):
             try:
                 timeout = aiohttp.ClientTimeout(total=max(self.request_timeout, 60))
                 async with aiohttp.ClientSession(timeout=timeout, headers=headers, trust_env=True) as session:
+                    await self._throttle_network()
                     async with session.post(download_url, data=form_data) as response:
                         if response.status != 200:
                             raise RuntimeError(f"PDF 요청 실패: HTTP {response.status}")
@@ -274,6 +330,7 @@ class BaseCrawler(ABC):
                 self.logger.warning("PDF aiohttp 다운로드 ENETUNREACH 감지, APIRequestContext fallback 시도")
                 if not hasattr(context, "request"):
                     raise RuntimeError(f"PDF HTTP 다운로드 실패(ENETUNREACH) 및 fallback 불가: {http_error}") from http_error
+                await self._throttle_network()
                 response = await context.request.post(download_url, form=form_data, timeout=self.timeout_ms)
                 if response.status != 200:
                     raise RuntimeError(f"PDF 요청 실패(APIRequestContext): HTTP {response.status}")
@@ -306,6 +363,7 @@ class BaseCrawler(ABC):
     ) -> bytes:
         page = await context.new_page()
         try:
+            await self._throttle_network()
             await page.goto(self.viewer_base_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             result = await page.evaluate(
                 """async ({ url, formData }) => {

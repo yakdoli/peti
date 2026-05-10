@@ -119,8 +119,9 @@ class SearchThemaCrawler(BaseCrawler):
         self.max_retries = int(crawler_config.get("max_retries", 3))
         self.chunk_size = int(download_config.get("chunk_size", 8192))
         self.pdf_dir = self._search_thema_pdf_dir(download_config.get("pdf_directory", "artifacts/pdfs"))
-        self.metadata_manager = MetadataManager()
-        self._use_search_thema_metadata_dir(download_config.get("metadata_directory", "artifacts/metadata"))
+        self.metadata_manager = MetadataManager(
+            self._search_thema_metadata_dir(download_config.get("metadata_directory", "artifacts/metadata"))
+        )
         self.state = CrawlState(state_file or self.config.get("state.file", "artifacts/state/crawl_state.json"))
 
         self.stats: Dict[str, Any] = {
@@ -332,6 +333,7 @@ class SearchThemaCrawler(BaseCrawler):
                 response_json: Dict[str, Any] | None = None
                 if context is not None and hasattr(context, "request"):
                     try:
+                        await self._throttle_network()
                         response = await context.request.post(
                             self.search_api_url,
                             form=payload,
@@ -346,6 +348,7 @@ class SearchThemaCrawler(BaseCrawler):
                         )
                 if response_json is None:
                     async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                        await self._throttle_network()
                         async with session.post(self.search_api_url, data=payload) as response:
                             if response.status != 200:
                                 raise RuntimeError(f"HTTP {response.status}: {self.search_api_url}")
@@ -471,6 +474,7 @@ class SearchThemaCrawler(BaseCrawler):
         headers = self._browser_headers(viewer_url)
         timeout = aiohttp.ClientTimeout(total=max(self.request_timeout, 60))
         async with aiohttp.ClientSession(timeout=timeout, headers=headers, trust_env=True) as session:
+            await self._throttle_network()
             async with session.get(viewer_url) as viewer_response:
                 if viewer_response.status != 200:
                     raise RuntimeError(f"뷰어 요청 실패: HTTP {viewer_response.status}")
@@ -482,6 +486,7 @@ class SearchThemaCrawler(BaseCrawler):
     async def _download_with_playwright_fallback(self, context: Any, item: Dict[str, Any]) -> Dict[str, Any]:
         viewer_path = item.get("viewer_path", "")
         viewer_url = self._viewer_url_for_item(item, str(viewer_path))
+        await self._throttle_network()
         viewer_response = await context.request.get(viewer_url, timeout=self.timeout_ms)
         if viewer_response.status != 200:
             raise RuntimeError(f"Playwright 뷰어 요청 실패: HTTP {viewer_response.status}")
@@ -536,6 +541,7 @@ class SearchThemaCrawler(BaseCrawler):
             payload["searchKeyword"] = institution
 
         if context is not None and hasattr(context, "request"):
+            await self._throttle_network()
             response = await context.request.post(self.pety_list_url.replace("petyList", "petyListAjax"), form=payload, timeout=self.timeout_ms)
             if response.status != 200:
                 return []
@@ -543,6 +549,7 @@ class SearchThemaCrawler(BaseCrawler):
         else:
             timeout = aiohttp.ClientTimeout(total=self.request_timeout)
             async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                await self._throttle_network()
                 async with session.post(self.pety_list_url.replace("petyList", "petyListAjax"), data=payload) as response:
                     if response.status != 200:
                         return []
