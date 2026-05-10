@@ -11,6 +11,15 @@ from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 
 try:
+    from playwright.async_api import BrowserContext, async_playwright  # type: ignore[reportMissingImports]
+
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    BrowserContext = Any
+    async_playwright = None
+    HAS_PLAYWRIGHT = False
+
+try:
     import aiohttp  # type: ignore[reportMissingImports]
 except ImportError:
     class _MissingAioHttp:
@@ -131,28 +140,23 @@ class SearchThemaCrawler(BaseCrawler):
         self.logger.info("=" * 60)
 
         try:
-            for year in self.years:
-                if self._limit_reached:
-                    break
-                for institution in self.institutions:
-                    if self._limit_reached:
-                        break
-                    if self._should_skip_combination(year, institution):
-                        continue
-
-                    try:
-                        combination_stats = await self._crawl_combination(context, year, institution)
-                    except Exception as exc:
-                        self.logger.error(f"조합 수집 실패 {year}/{institution}: {exc}")
-                        combination_stats = {"year": str(year), "institution": self._institution_state_value(institution), "error": str(exc)}
-                    if not self._limit_reached and self.limit is None:
-                        self.state.mark_search_thema_completed(
-                            str(year),
-                            self._institution_state_value(institution),
-                            self._state_mode(),
-                            combination_stats,
-                        )
-                        self.stats["completed_combinations"] += 1
+            if context is None and HAS_PLAYWRIGHT:
+                assert async_playwright is not None
+                try:
+                    async with async_playwright() as playwright:
+                        browser = await playwright.chromium.launch(headless=self.headless)
+                        browser_context = await browser.new_context(ignore_https_errors=True)
+                        try:
+                            await self._prime_browser_session(browser_context)
+                            await self._crawl_all_combinations(browser_context)
+                        finally:
+                            await browser_context.close()
+                            await browser.close()
+                except Exception as exc:
+                    self.logger.warning(f"브라우저 세션 초기화 실패, HTTP 모드로 진행: {exc}")
+                    await self._crawl_all_combinations(None)
+            else:
+                await self._crawl_all_combinations(context)
         finally:
             self.stats["end_time"] = datetime.now()
             if self.save_indexes:
@@ -164,6 +168,38 @@ class SearchThemaCrawler(BaseCrawler):
         self.logger.info("SearchThema 크롤링 완료")
         self.logger.info("=" * 60)
         return self._get_statistics()
+
+
+    async def _crawl_all_combinations(self, context: Any) -> None:
+        for year in self.years:
+            if self._limit_reached:
+                break
+            for institution in self.institutions:
+                if self._limit_reached:
+                    break
+                if self._should_skip_combination(year, institution):
+                    continue
+
+                try:
+                    combination_stats = await self._crawl_combination(context, year, institution)
+                except Exception as exc:
+                    self.logger.error(f"조합 수집 실패 {year}/{institution}: {exc}")
+                    combination_stats = {"year": str(year), "institution": self._institution_state_value(institution), "error": str(exc)}
+                if not self._limit_reached and self.limit is None:
+                    self.state.mark_search_thema_completed(
+                        str(year),
+                        self._institution_state_value(institution),
+                        self._state_mode(),
+                        combination_stats,
+                    )
+                    self.stats["completed_combinations"] += 1
+
+    async def _prime_browser_session(self, context: BrowserContext) -> None:
+        page = await context.new_page()
+        try:
+            await page.goto(self.theme_info_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        finally:
+            await page.close()
 
     async def _crawl_combination(self, context: Any, year: int | str, institution: str | None) -> Dict[str, Any]:
         self.logger.info(f"SearchThema 조합 수집: {year} / {self._institution_log_value(institution)}")
@@ -180,7 +216,7 @@ class SearchThemaCrawler(BaseCrawler):
 
         page_number = 1
         while not self._limit_reached:
-            items = await self.fetch_items(year, institution, page_number)
+            items = await self.fetch_items(year, institution, page_number, context=context)
             if not items:
                 break
             combination_stats["pages"] += 1
@@ -256,6 +292,7 @@ class SearchThemaCrawler(BaseCrawler):
         *args: Any,
         year: int | str | None = None,
         institution: Optional[str] = None,
+        context: Any = None,
     ) -> List[Dict[str, Any]]:
         if len(args) == 2:
             year = page_number
@@ -285,13 +322,25 @@ class SearchThemaCrawler(BaseCrawler):
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         for attempt in range(1, self.max_retries + 1):
             try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(self.search_api_url, data=payload) as response:
-                        if response.status != 200:
-                            raise RuntimeError(f"HTTP {response.status}: {self.search_api_url}")
-                        response_json = await self._response_json(response)
-                        if response_json.get("error"):
-                            raise RuntimeError(f"SearchThema API 오류: {response_json['error']}")
+                if context is not None and hasattr(context, "request"):
+                    response = await context.request.post(
+                        self.search_api_url,
+                        form=payload,
+                        timeout=self.timeout_ms,
+                    )
+                    if response.status != 200:
+                        raise RuntimeError(f"HTTP {response.status}: {self.search_api_url}")
+                    response_json = await response.json()
+                    if response_json.get("error"):
+                        raise RuntimeError(f"SearchThema API 오류: {response_json['error']}")
+                else:
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(self.search_api_url, data=payload) as response:
+                            if response.status != 200:
+                                raise RuntimeError(f"HTTP {response.status}: {self.search_api_url}")
+                            response_json = await self._response_json(response)
+                            if response_json.get("error"):
+                                raise RuntimeError(f"SearchThema API 오류: {response_json['error']}")
 
                 pages = parse_search_thema_response(response_json)
                 self.stats["visited_pages"] += 1
