@@ -91,3 +91,76 @@ def test_existing_pdf_incomplete_missing_file(tmp_path: Path) -> None:
     assert crawler._existing_pdf_is_complete(
         {"pdf": {"status": "completed", "path": str(tmp_path / "missing.pdf")}}
     ) is False
+
+
+def test_annotate_ocr_strategy_text_pdf(tmp_path: Path) -> None:
+    crawler = DummyCrawler(tmp_path)
+    pdf_path = tmp_path / "text.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 dummy")
+
+    item = {"id": "1", "ocr": {"status": "pending", "ready_dir": "", "extracted_metadata": {}}}
+    crawler._extract_text_pdf_metadata = Mock(return_value={"text_extractable": True, "pages": 1})
+
+    crawler._annotate_ocr_strategy(item, pdf_path)
+
+    assert item["ocr"]["status"] == "skipped_text_extractable"
+    assert item["ocr"]["skip_reason"] == "text_extractable_pdf"
+    assert item["ocr"]["extracted_metadata"]["text_extractable"] is True
+
+
+def test_annotate_ocr_strategy_image_pdf(tmp_path: Path) -> None:
+    crawler = DummyCrawler(tmp_path)
+    pdf_path = tmp_path / "image.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 dummy")
+
+    item = {"id": "2", "ocr": {"status": "pending", "ready_dir": "", "extracted_metadata": {}}}
+    crawler._extract_text_pdf_metadata = Mock(return_value={"text_extractable": False, "pages": 1})
+
+    crawler._annotate_ocr_strategy(item, pdf_path)
+
+    assert item["ocr"]["status"] == "pending"
+    assert item["ocr"]["skip_reason"] == ""
+    assert item["ocr"]["extracted_metadata"]["text_extractable"] is False
+
+
+def test_extract_text_pdf_metadata_detects_text(tmp_path: Path) -> None:
+    crawler = DummyCrawler(tmp_path)
+    pdf_path = tmp_path / "text_extractable.pdf"
+    pdf_path.write_bytes(b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 144]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj
+4 0 obj<</Length 44>>stream
+BT /F1 24 Tf 72 72 Td (Hello OCR Skip) Tj ET
+endstream endobj
+5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj
+xref
+0 6
+0000000000 65535 f 
+0000000010 00000 n 
+0000000060 00000 n 
+0000000117 00000 n 
+0000000243 00000 n 
+0000000347 00000 n 
+trailer<</Size 6/Root 1 0 R>>
+startxref
+417
+%%EOF
+""")
+
+    result = crawler._extract_text_pdf_metadata(pdf_path)
+
+    assert result["text_extractable"] is True
+    assert result["text_pages"] >= 1
+    assert result["total_chars"] > 0
+
+
+def test_extract_text_pdf_metadata_handles_invalid_file(tmp_path: Path) -> None:
+    crawler = DummyCrawler(tmp_path)
+    broken = tmp_path / "broken.pdf"
+    broken.write_bytes(b"not-a-pdf")
+
+    result = crawler._extract_text_pdf_metadata(broken)
+
+    assert result["text_extractable"] is False
+    assert "error" in result

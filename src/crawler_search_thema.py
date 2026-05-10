@@ -231,6 +231,9 @@ class SearchThemaCrawler(BaseCrawler):
             for item in items:
                 if self._limit_reached:
                     break
+                if self.limit is not None and self.stats["total_items"] >= self.limit:
+                    self._limit_reached = True
+                    break
                 prepared = self._metadata_item_from_raw(item)
                 combination_stats["items"] += 1
                 self.stats["total_items"] += 1

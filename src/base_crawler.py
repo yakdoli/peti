@@ -6,6 +6,7 @@ import hashlib
 import asyncio
 import re
 import socket
+from PyPDF2 import PdfReader
 from abc import ABC, abstractmethod
 from datetime import datetime
 from logging import Logger
@@ -118,11 +119,50 @@ class BaseCrawler(ABC):
 
         result = await self._download_pdf_stream(context, download_url, form_data, pdf_path)
         item["pdf"].update(result)
+        self._annotate_ocr_strategy(item, pdf_path)
         item["status"] = "completed"
         self.stats["downloaded_pdfs"] += 1
         self.logger.info(f"PDF 다운로드 완료: {pdf_path}")
         return item
 
+
+
+    def _annotate_ocr_strategy(self, item: Dict[str, Any], pdf_path: Path) -> None:
+        """텍스트 추출 가능 PDF는 OCR 없이 메타데이터를 생성하고, 이미지형 PDF만 OCR 대상으로 남긴다."""
+        ocr = item.setdefault("ocr", {})
+        extracted = self._extract_text_pdf_metadata(pdf_path)
+        if extracted.get("text_extractable"):
+            ocr["status"] = "skipped_text_extractable"
+            ocr["skip_reason"] = "text_extractable_pdf"
+            ocr["extracted_metadata"] = extracted
+            return
+
+        ocr.setdefault("status", "pending")
+        ocr["skip_reason"] = ""
+        ocr["extracted_metadata"] = extracted
+
+    def _extract_text_pdf_metadata(self, pdf_path: Path) -> Dict[str, Any]:
+        try:
+            reader = PdfReader(str(pdf_path))
+        except Exception as e:
+            return {"text_extractable": False, "error": str(e)}
+
+        text_pages = 0
+        total_chars = 0
+        for page in reader.pages:
+            text = (page.extract_text() or "").strip()
+            if text:
+                text_pages += 1
+                total_chars += len(text)
+
+        return {
+            "text_extractable": text_pages > 0,
+            "pages": len(reader.pages),
+            "text_pages": text_pages,
+            "total_chars": total_chars,
+            "pdf_metadata": {k: str(v) for k, v in (reader.metadata or {}).items()},
+            "generated_at": datetime.now().isoformat(),
+        }
     async def _fetch_viewer_html_via_browser_page(self, context: Any, viewer_url: str) -> str:
         page = await context.new_page()
         try:
