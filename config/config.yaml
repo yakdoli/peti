@@ -9,6 +9,7 @@ crawler:
   window_days: 31
   row_per_page: 10
   headless: true
+  ignore_https_errors: true
   browser_executable_path: ""
   themes:
     pety:

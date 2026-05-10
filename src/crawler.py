@@ -72,6 +72,7 @@ class GwanboCrawler(BaseCrawler):
         self.limit = limit
         self.window_days = window_days or int(crawler_config.get("window_days", 31))
         self.headless = crawler_config.get("headless", True) if headless is None else headless
+        self.ignore_https_errors = bool(crawler_config.get("ignore_https_errors", False))
         self.save_indexes = save_indexes
         self.browser_executable_path = crawler_config.get("browser_executable_path", "")
 
@@ -132,6 +133,7 @@ class GwanboCrawler(BaseCrawler):
                 browser = await self._launch_browser(playwright)
                 context = await browser.new_context(
                     accept_downloads=True,
+                    ignore_https_errors=self.ignore_https_errors,
                     extra_http_headers={
                         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
                         "User-Agent": (
@@ -280,20 +282,54 @@ class GwanboCrawler(BaseCrawler):
         last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = await context.request.post(
-                    self.ajax_url,
-                    form=form,
-                    headers={"X-Requested-With": "XMLHttpRequest"},
-                    timeout=self.timeout_ms,
-                )
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}: {self.ajax_url}")
-                return await response.text()
+                try:
+                    response = await context.request.post(
+                        self.ajax_url,
+                        form=form,
+                        headers={"X-Requested-With": "XMLHttpRequest"},
+                        timeout=self.timeout_ms,
+                    )
+                    if response.status != 200:
+                        raise RuntimeError(f"HTTP {response.status}: {self.ajax_url}")
+                    return await response.text()
+                except Exception as api_error:
+                    if "ENETUNREACH" not in str(api_error):
+                        raise
+                    self.logger.warning("APIRequestContext ENETUNREACH 감지, 브라우저 페이지 fetch fallback 시도")
+                    return await self._fetch_list_page_via_browser_page(context, form)
             except Exception as e:
                 last_error = e
                 self.logger.warning(f"목록 요청 재시도 {attempt}/{self.max_retries}: {e}")
                 await asyncio.sleep(self.retry_delay)
         raise RuntimeError(f"목록 요청 실패: {last_error}")
+
+    async def _fetch_list_page_via_browser_page(self, context: Any, form: Dict[str, str]) -> str:
+        page = await context.new_page()
+        try:
+            await page.goto(self.list_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            result = await page.evaluate(
+                """async ({ url, formData }) => {
+                    const body = new URLSearchParams(formData).toString();
+                    const response = await fetch(url, {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                            "X-Requested-With": "XMLHttpRequest"
+                        },
+                        body
+                    });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    return await response.text();
+                }""",
+                {"url": self.ajax_url, "formData": form},
+            )
+            if not isinstance(result, str):
+                raise RuntimeError("브라우저 fetch 응답이 문자열이 아닙니다.")
+            return result
+        finally:
+            await page.close()
 
     async def _process_item(self, context: Any, item: Dict[str, Any]) -> bool:
         if self.limit is not None and self.stats["total_items"] >= self.limit:
