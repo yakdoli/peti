@@ -49,12 +49,14 @@ try:
     from .config import get_config
     from .crawl_state import CrawlState
     from .metadata_manager import MetadataManager
+    from .pety_parser import parse_pety_list_page
     from .search_thema_parser import parse_search_thema_response
 except ImportError:
     from base_crawler import BaseCrawler  # type: ignore[reportMissingImports]
     from config import get_config  # type: ignore[reportMissingImports]
     from crawl_state import CrawlState  # type: ignore[reportMissingImports]
     from metadata_manager import MetadataManager  # type: ignore[reportMissingImports]
+    from pety_parser import parse_pety_list_page  # type: ignore[reportMissingImports]
     from search_thema_parser import parse_search_thema_response  # type: ignore[reportMissingImports]
 
 try:
@@ -103,6 +105,8 @@ class SearchThemaCrawler(BaseCrawler):
         self.search_api_url = search_config.get("search_api_url", "https://gwanbo.go.kr/SearchRestApi.jsp")
         self.theme_info_url = search_config.get("theme_info_url", "https://gwanbo.go.kr/user/search/getThemeBaseInfo.do")
         self.viewer_base_url = search_config.get("viewer_base_url", "https://gwanbo.go.kr/")
+        self.pety_list_url = search_config.get("pety_list_url", "https://open.gwanbo.go.kr/OpenApi/web/petyList")
+        self.enable_pety_html_fallback = bool(search_config.get("enable_pety_html_fallback", False))
         self.search_index = str(search_config.get("index", "gwanbo"))
         self.list_size = int(search_config.get("list_size", 10))
         self.institution_query_map = dict(search_config.get("institution_query_map", {}))
@@ -322,25 +326,29 @@ class SearchThemaCrawler(BaseCrawler):
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         for attempt in range(1, self.max_retries + 1):
             try:
+                response_json: Dict[str, Any] | None = None
                 if context is not None and hasattr(context, "request"):
-                    response = await context.request.post(
-                        self.search_api_url,
-                        form=payload,
-                        timeout=self.timeout_ms,
-                    )
-                    if response.status != 200:
-                        raise RuntimeError(f"HTTP {response.status}: {self.search_api_url}")
-                    response_json = await response.json()
-                    if response_json.get("error"):
-                        raise RuntimeError(f"SearchThema API 오류: {response_json['error']}")
-                else:
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                    try:
+                        response = await context.request.post(
+                            self.search_api_url,
+                            form=payload,
+                            timeout=self.timeout_ms,
+                        )
+                        if response.status != 200:
+                            raise RuntimeError(f"HTTP {response.status}: {self.search_api_url}")
+                        response_json = await response.json()
+                    except Exception as browser_error:
+                        self.logger.warning(
+                            f"Playwright 요청 실패, aiohttp 폴백 시도: {browser_error}"
+                        )
+                if response_json is None:
+                    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
                         async with session.post(self.search_api_url, data=payload) as response:
                             if response.status != 200:
                                 raise RuntimeError(f"HTTP {response.status}: {self.search_api_url}")
                             response_json = await self._response_json(response)
-                            if response_json.get("error"):
-                                raise RuntimeError(f"SearchThema API 오류: {response_json['error']}")
+                if response_json.get("error"):
+                    raise RuntimeError(f"SearchThema API 오류: {response_json['error']}")
 
                 pages = parse_search_thema_response(response_json)
                 self.stats["visited_pages"] += 1
@@ -352,6 +360,11 @@ class SearchThemaCrawler(BaseCrawler):
                     items.extend(entry.get("list") or [])
                 return items
             except Exception as exc:
+                fallback_items = await self._fallback_items_from_error(exc, context, year, institution, page_number)
+                if fallback_items is not None:
+                    self.logger.warning("SearchThema JSON 파싱 실패, petyList 방식 폴백으로 계속 진행합니다.")
+                    self.stats["visited_pages"] += 1
+                    return fallback_items
                 last_error = exc
                 if attempt < self.max_retries:
                     self.logger.warning(f"SearchThema 목록 요청 재시도 {attempt}/{self.max_retries}: {exc}")
@@ -454,7 +467,7 @@ class SearchThemaCrawler(BaseCrawler):
 
         headers = self._browser_headers(viewer_url)
         timeout = aiohttp.ClientTimeout(total=max(self.request_timeout, 60))
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers, trust_env=True) as session:
             async with session.get(viewer_url) as viewer_response:
                 if viewer_response.status != 200:
                     raise RuntimeError(f"뷰어 요청 실패: HTTP {viewer_response.status}")
@@ -487,6 +500,53 @@ class SearchThemaCrawler(BaseCrawler):
                 text = await response.text()
             return json.loads(text)
         return await response.json(content_type=None)
+
+    async def _fallback_items_from_error(
+        self,
+        error: Exception,
+        context: Any,
+        year: int | str,
+        institution: str | None,
+        page_number: int,
+    ) -> List[Dict[str, Any]] | None:
+        if not isinstance(error, (json.JSONDecodeError, ValueError, TypeError)):
+            return None
+        if not self.enable_pety_html_fallback:
+            return None
+        return await self._fetch_items_via_pety_style(context, year, institution, page_number)
+
+    async def _fetch_items_via_pety_style(
+        self,
+        context: Any,
+        year: int | str,
+        institution: str | None,
+        page_number: int,
+    ) -> List[Dict[str, Any]]:
+        payload = {
+            "themaSe": "02",
+            "searchType": "4",
+            "rowPerPage": str(self.list_size),
+            "pageNum": str(page_number),
+            "searchCondition": str(year),
+        }
+        if institution:
+            payload["searchKeyword"] = institution
+
+        if context is not None and hasattr(context, "request"):
+            response = await context.request.post(self.pety_list_url.replace("petyList", "petyListAjax"), form=payload, timeout=self.timeout_ms)
+            if response.status != 200:
+                return []
+            response_html = await response.text()
+        else:
+            timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.post(self.pety_list_url.replace("petyList", "petyListAjax"), data=payload) as response:
+                    if response.status != 200:
+                        return []
+                    response_html = await response.text()
+
+        parsed = parse_pety_list_page(response_html, self.pety_list_url)
+        return parsed.items
 
     def _pdf_path_for_item(self, item: Dict[str, Any]) -> Path:
         date_text = self._item_date(item)
