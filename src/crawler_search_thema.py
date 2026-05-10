@@ -229,8 +229,8 @@ class SearchThemaCrawler(BaseCrawler):
                         combination_stats["failed_downloads"] += 1
                     elif isinstance(result, dict):
                         item_ref.update(result)
-                        self.stats["downloaded_pdfs"] += 1
-                        combination_stats["downloaded_pdfs"] += 1
+                        if item_ref.get("pdf", {}).get("status") == "completed":
+                            combination_stats["downloaded_pdfs"] += 1
                     item_ref["updated_at"] = datetime.now().isoformat()
                     self.metadata_manager.save_item(item_ref)
                     self.stats["saved_items"] += 1
@@ -393,6 +393,7 @@ class SearchThemaCrawler(BaseCrawler):
 
         item["pdf"].update(result)
         item["status"] = "completed"
+        self.stats["downloaded_pdfs"] += 1
         self.logger.info(f"SearchThema PDF 다운로드 완료: {result['path']}")
         return item
 
