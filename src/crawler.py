@@ -57,7 +57,7 @@ class GwanboCrawler(BaseCrawler):
         self.config = get_config()
         self.logger = setup_logger(__name__)
         self.metadata_manager = MetadataManager()
-        self.state = CrawlState(state_file or self.config.get("state.file", "data/state/crawl_state.json"))
+        self.state = CrawlState(state_file or self.config.get("state.file", "artifacts/state/crawl_state.json"))
 
         crawler_config = self.config.get_crawler_config()
         download_config = self.config.get_download_config()
@@ -87,8 +87,8 @@ class GwanboCrawler(BaseCrawler):
         self.request_timeout = int(crawler_config.get("timeout", 30))
         self.retry_delay = float(crawler_config.get("retry_delay", 2))
         self.max_retries = int(crawler_config.get("max_retries", 3))
-        self.pdf_dir = Path(download_config.get("pdf_directory", "data/pdfs"))
-        self.ocr_ready_dir = Path(download_config.get("ocr_ready_directory", "data/ocr_ready"))
+        self.pdf_dir = Path(download_config.get("pdf_directory", "artifacts/pdfs"))
+        self.ocr_ready_dir = Path(download_config.get("ocr_ready_directory", "artifacts/ocr_ready"))
         self.chunk_size = int(download_config.get("chunk_size", 8192))
 
         self.stats: Dict[str, Any] = {

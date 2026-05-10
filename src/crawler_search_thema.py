@@ -105,10 +105,10 @@ class SearchThemaCrawler(BaseCrawler):
         self.retry_delay = float(crawler_config.get("retry_delay", 2))
         self.max_retries = int(crawler_config.get("max_retries", 3))
         self.chunk_size = int(download_config.get("chunk_size", 8192))
-        self.pdf_dir = self._search_thema_pdf_dir(download_config.get("pdf_directory", "data/pdfs"))
+        self.pdf_dir = self._search_thema_pdf_dir(download_config.get("pdf_directory", "artifacts/pdfs"))
         self.metadata_manager = MetadataManager()
-        self._use_search_thema_metadata_dir(download_config.get("metadata_directory", "data/metadata"))
-        self.state = CrawlState(state_file or self.config.get("state.file", "data/state/crawl_state.json"))
+        self._use_search_thema_metadata_dir(download_config.get("metadata_directory", "artifacts/metadata"))
+        self.state = CrawlState(state_file or self.config.get("state.file", "artifacts/state/crawl_state.json"))
 
         self.stats: Dict[str, Any] = {
             "theme": self.theme,
@@ -393,7 +393,6 @@ class SearchThemaCrawler(BaseCrawler):
 
         item["pdf"].update(result)
         item["status"] = "completed"
-        self.stats["downloaded_pdfs"] += 1
         self.logger.info(f"SearchThema PDF 다운로드 완료: {result['path']}")
         return item
 

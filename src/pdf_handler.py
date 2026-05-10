@@ -22,8 +22,8 @@ class PDFHandler:
         """PDF 핸들러를 초기화합니다."""
         self.config = get_config()
         self.logger = setup_logger(__name__)
-        self.pdf_dir = Path(self.config.get_download_config().get('pdf_directory', 'data/pdfs'))
-        self.ocr_ready_dir = Path(self.config.get_download_config().get('ocr_ready_directory', 'data/ocr_ready'))
+        self.pdf_dir = Path(self.config.get_download_config().get('pdf_directory', 'artifacts/pdfs'))
+        self.ocr_ready_dir = Path(self.config.get_download_config().get('ocr_ready_directory', 'artifacts/ocr_ready'))
         
         self.pdf_dir.mkdir(parents=True, exist_ok=True)
         self.ocr_ready_dir.mkdir(parents=True, exist_ok=True)

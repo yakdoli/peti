@@ -33,13 +33,20 @@ class Config:
     def _ensure_directories(self) -> None:
         """필요한 디렉토리를 생성합니다."""
         download_config = self.config.get('download', {})
+        state_config = self.config.get('state', {})
+        dataset_config = self.config.get('dataset', {})
         
         directories = [
-            download_config.get('pdf_directory', 'data/pdfs'),
-            download_config.get('metadata_directory', 'data/metadata'),
-            download_config.get('ocr_ready_directory', 'data/ocr_ready'),
+            download_config.get('pdf_directory', 'artifacts/pdfs'),
+            download_config.get('metadata_directory', 'artifacts/metadata'),
+            download_config.get('ocr_ready_directory', 'artifacts/ocr_ready'),
             self.config.get('logging', {}).get('log_file', 'logs/crawler.log').rsplit('/', 1)[0],
+            Path(state_config.get('file', 'artifacts/state/crawl_state.json')).parent,
         ]
+
+        dataset_directory = dataset_config.get('output_directory')
+        if dataset_directory:
+            directories.append(dataset_directory)
         
         for directory in directories:
             Path(directory).mkdir(parents=True, exist_ok=True)

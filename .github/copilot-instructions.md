@@ -19,16 +19,27 @@ ko-perty/
 │   ├── config.py            # 설정 관리
 │   ├── logger.py            # 로깅 설정
 │   ├── crawler.py           # 메인 크롤러
+│   ├── crawler_search_thema.py # SearchThema 크롤러
 │   ├── metadata_manager.py  # 메타데이터 관리
 │   └── pdf_handler.py       # PDF 처리
-├── data/
+├── crawl.py                 # 관보 크롤러 진입점
+├── crawl_search_thema.py    # SearchThema 진입점
+├── artifacts/
 │   ├── pdfs/                # 다운로드 PDF
 │   ├── metadata/            # 메타데이터 JSON/CSV
-│   └── ocr_ready/           # OCR 준비 이미지
+│   ├── ocr_ready/           # OCR 준비 이미지
+│   └── searchThema/         # SearchThema 전용 아티팩트
+├── datasets/                # Hugging Face export 대상
 ├── logs/                    # 로그 파일
 ├── requirements.txt         # 의존성
 └── README.md               # 프로젝트 문서
 ```
+
+## 정리 원칙
+
+- 소스 프로젝트는 `src/`와 실행 진입점만 포함합니다.
+- 생성 산출물은 소스 구분별, 상세 구분별로 `artifacts/` 아래에 분리해서 저장합니다.
+- OCR 결과와 허깅페이스 데이터셋은 별도 아티팩트로 취급하고, 저장소에는 대용량 원본을 두지 않습니다.
 
 ## 사용 방법
 

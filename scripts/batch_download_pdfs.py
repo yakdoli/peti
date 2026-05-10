@@ -365,8 +365,8 @@ async def main():
     st = config.get_search_thema_config()
     viewer_base = st.get("viewer_base_url", "https://gwanbo.go.kr/")
     download_cfg = config.get_download_config()
-    pdf_dir = Path(download_cfg.get("pdf_directory", "data/pdfs"))
-    metadata_dir = Path(download_cfg.get("metadata_directory", "data/metadata"))
+    pdf_dir = Path(download_cfg.get("pdf_directory", "artifacts/pdfs"))
+    metadata_dir = Path(download_cfg.get("metadata_directory", "artifacts/metadata"))
 
     if "searchThema" not in str(pdf_dir):
         if pdf_dir.name == "pdfs":

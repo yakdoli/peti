@@ -2,6 +2,7 @@ requests==2.31.0
 beautifulsoup4==4.12.2
 lxml==6.1.0
 pandas==2.3.3
+duckdb==1.5.2
 python-dateutil==2.8.2
 pydantic==2.13.4
 tqdm==4.66.1

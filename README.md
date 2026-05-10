@@ -2,6 +2,14 @@
 
 대한민국 전자관보 공개 화면에서 `petyList` 공직자 재산 공개 메타데이터와 PDF를 수집하는 Python 프로젝트입니다. Playwright 브라우저 컨텍스트로 세션을 만들고, 같은 세션에서 목록 AJAX와 PDF 다운로드 POST를 수행합니다.
 
+## 저장소 정리 원칙
+
+이 저장소는 크롤러 소스와 생성 산출물을 분리해서 관리합니다. 자세한 구조는 [PROJECT_LAYOUT.md](PROJECT_LAYOUT.md)를 참고하세요.
+
+- 소스 프로젝트: `src/`, `crawl*.py`, `scripts/`
+- 아티팩트 프로젝트: `artifacts/` 아래의 메타데이터, PDF, OCR 준비본
+- 허깅페이스 데이터셋: 단일 export 단위로 취급
+
 ## 주요 기능
 
 - 1994년 1월 1일부터 현재까지의 장기 날짜 범위 수집
@@ -9,7 +17,7 @@
 - 항목별 PDF 다운로드와 SHA-256 해시 기록
 - 항목별 JSON 원본 저장
 - `metadata.json`, `metadata.csv`, `metadata_{category}.json` 인덱스 생성
-- `data/state/crawl_state.json` 기반 재시작
+- `artifacts/state/crawl_state.json` 기반 재시작
 - OCR 준비용 metadata 필드와 PDF 이미지 변환 모듈
 
 ## 설치
@@ -51,12 +59,12 @@ crawler:
       viewer_base_url: "https://gwanbo.go.kr/"
 
 state:
-  file: "data/state/crawl_state.json"
+  file: "artifacts/state/crawl_state.json"
 
 download:
-  pdf_directory: "data/pdfs"
-  metadata_directory: "data/metadata"
-  ocr_ready_directory: "data/ocr_ready"
+  pdf_directory: "artifacts/pdfs"
+  metadata_directory: "artifacts/metadata"
+  ocr_ready_directory: "artifacts/ocr_ready"
 ```
 
 ## 실행
@@ -99,7 +107,13 @@ python validate_pdfs.py
 ## 데이터 구조
 
 ```text
-data/
+src/
+├── crawler.py
+├── crawler_search_thema.py
+├── metadata_manager.py
+└── pdf_handler.py
+
+artifacts/
 ├── metadata/
 │   ├── items/{YYYY}/{YYYYMMDD}/{item_id}.json
 │   ├── metadata.json
@@ -107,7 +121,11 @@ data/
 │   └── metadata_*.json
 ├── pdfs/{YYYY}/{YYYYMMDD}/{item_id}.pdf
 ├── state/crawl_state.json
-└── ocr_ready/
+├── ocr_ready/
+└── searchThema/
+  ├── metadata/
+  ├── pdfs/
+  └── state/
 ```
 
 항목 JSON 예시:

@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headed", action="store_true", help="브라우저를 headless=false로 실행합니다.")
     parser.add_argument("--limit-per-batch", type=int, help="각 배치에서 최대 처리할 항목 수")
     parser.add_argument("--logs-dir", default="logs/batches", help="배치별 로그 저장 디렉토리")
-    parser.add_argument("--state-dir", default="data/state/batches", help="배치별 상태 파일 저장 디렉토리")
+    parser.add_argument("--state-dir", default="artifacts/state/batches", help="배치별 상태 파일 저장 디렉토리")
     parser.add_argument("--skip-rebuild-index", action="store_true", help="모든 배치 완료 후 인덱스 재생성을 생략")
     parser.add_argument("--dry-run", action="store_true", help="배치와 명령만 출력하고 실행하지 않음")
     return parser.parse_args()

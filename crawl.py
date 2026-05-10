@@ -5,13 +5,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
-from pathlib import Path
 from typing import Optional
 
-project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(project_root / "src"))
+from entrypoint_utils import add_project_paths, configure_windows_asyncio_policy, log_stats
+
+add_project_paths()
 
 from src.crawler import GwanboCrawler
 from src.logger import setup_logger
@@ -60,18 +58,12 @@ async def run_crawler(args: argparse.Namespace) -> Optional[dict]:
         state_file=args.state_file,
     )
     stats = await crawler.crawl()
-
-    logger.info("=" * 60)
-    logger.info("크롤링 통계")
-    logger.info("=" * 60)
-    for key, value in stats.items():
-        logger.info(f"  {key}: {value}")
+    log_stats(logger, "크롤링 통계", stats)
     return stats
 
 
 def main() -> None:
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    configure_windows_asyncio_policy()
     asyncio.run(run_crawler(parse_args()))
 
 

@@ -20,7 +20,7 @@ except ImportError:
 class PDFValidator:
     """PDF 파일 검증 클래스"""
 
-    def __init__(self, pdf_directory: str = "data/pdfs"):
+    def __init__(self, pdf_directory: str = "artifacts/pdfs"):
         """초기화"""
         self.pdf_dir = Path(pdf_directory)
         self.validation_results = []
@@ -248,7 +248,7 @@ class PDFValidator:
             'results': self.validation_results
         }
 
-    def save_report(self, output_file: str = "data/validation_report.json") -> bool:
+    def save_report(self, output_file: str = "artifacts/validation_report.json") -> bool:
         """검증 보고서를 저장합니다."""
         try:
             output_path = Path(output_file)
@@ -275,7 +275,7 @@ class PDFValidator:
 
 def main():
     """메인 함수"""
-    validator = PDFValidator("data/pdfs")
+    validator = PDFValidator("artifacts/pdfs")
     
     print("\n" + "=" * 70)
     print("📋 PDF 무결성 검증")
@@ -287,7 +287,7 @@ def main():
     # 보고서 저장
     print("\n💾 검증 보고서 저장 중...")
     if validator.save_report():
-        print("✅ 보고서 저장 완료: data/validation_report.json")
+        print("✅ 보고서 저장 완료: artifacts/validation_report.json")
     
     # 종합 결과
     print("\n" + "=" * 70)

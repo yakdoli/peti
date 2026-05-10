@@ -14,6 +14,8 @@ data/searchThema/pdfs/*
 !data/searchThema/state/
 data/searchThema/state/*
 !data/searchThema/state/.gitkeep
+artifacts/
+datasets/
 scripts/spike_results.json
 *.tmp
 .sisyphus/

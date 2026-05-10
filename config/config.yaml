@@ -38,15 +38,18 @@ crawler:
 
 # 재시작 상태 설정
 state:
-  file: "data/state/crawl_state.json"
+  file: "artifacts/state/crawl_state.json"
 
 # 다운로드 설정
 download:
-  pdf_directory: "data/pdfs"
-  metadata_directory: "data/metadata"
-  ocr_ready_directory: "data/ocr_ready"
+  pdf_directory: "artifacts/pdfs"
+  metadata_directory: "artifacts/metadata"
+  ocr_ready_directory: "artifacts/ocr_ready"
   chunk_size: 8192
   max_concurrent_downloads: 5
+
+dataset:
+  output_directory: "datasets/gwanbo"
 
 # 메타데이터 설정
 metadata:

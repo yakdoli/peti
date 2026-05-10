@@ -11,7 +11,7 @@ from typing import Any, Dict
 class CrawlState:
     """Small JSON-backed state store."""
 
-    def __init__(self, state_file: str = "data/state/crawl_state.json"):
+    def __init__(self, state_file: str = "artifacts/state/crawl_state.json"):
         self.state_file = Path(state_file)
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state: Dict[str, Any] = {
