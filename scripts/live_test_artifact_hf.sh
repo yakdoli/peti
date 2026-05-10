@@ -42,12 +42,12 @@ PY
 
 run_pety_live_test() {
   echo "[3/6] petyList 소규모 라이브 테스트"
-  python crawl.py --start-date "$PETY_DATE" --end-date "$PETY_DATE" --limit 1 --metadata-only --no-resume
+  python crawl.py --start-date "$PETY_DATE" --end-date "$PETY_DATE" --limit 1 --no-resume
 }
 
 run_search_live_test() {
-  echo "[4/6] searchThema 소규모 라이브 테스트"
-  python crawl_search_thema.py --year "$SEARCH_YEAR" --institution "$SEARCH_INST" --limit 1 --metadata-only --no-resume
+  echo "[4/6] searchThema 소규모 라이브 테스트 (PDF 라이브 다운로드 포함)"
+  python crawl_search_thema.py --year "$SEARCH_YEAR" --institution "$SEARCH_INST" --limit 1 --no-resume
 }
 
 sync_prefix() {
@@ -76,7 +76,7 @@ PY
 
 
 trim_search_artifacts() {
-  echo "[4.5/6] searchThema 결과 소규모화 (1건 유지)"
+  echo "[4.5/6] searchThema 결과/PDF 소규모화 (1건 유지)"
   python - <<'PY'
 import json
 from pathlib import Path
@@ -115,6 +115,13 @@ item_id = keep_id
 for fp in (base / 'items').rglob('*.json'):
     if fp.stem != item_id:
         fp.unlink()
+
+# PDF 파일도 1건만 유지
+pdf_root = Path('artifacts/searchThema/pdfs')
+if pdf_root.exists():
+    for pdf in pdf_root.rglob('*.pdf'):
+        if pdf.stem != item_id:
+            pdf.unlink()
 print('kept item id:', item_id)
 PY
 }
@@ -124,7 +131,7 @@ upload_results() {
   SYNC_SOURCE_DIR="artifacts/metadata" SYNC_PREFIX="$PETY_PREFIX/metadata" HF_BUCKET_ID="$HF_BUCKET_ID" sync_prefix "artifacts/metadata" "$PETY_PREFIX/metadata"
 
   echo "[6/6] searchThema 업로드"
-  SYNC_SOURCE_DIR="artifacts/searchThema/metadata" SYNC_PREFIX="$SEARCH_PREFIX/metadata" HF_BUCKET_ID="$HF_BUCKET_ID" sync_prefix "artifacts/searchThema/metadata" "$SEARCH_PREFIX/metadata"
+  SYNC_SOURCE_DIR="artifacts/searchThema" SYNC_PREFIX="$SEARCH_PREFIX" HF_BUCKET_ID="$HF_BUCKET_ID" sync_prefix "artifacts/searchThema" "$SEARCH_PREFIX"
 }
 
 HF_BUCKET_ID="$HF_BUCKET_ID" reset_local_artifacts
