@@ -2,6 +2,7 @@
 """HuggingFace 데이터셋 업로드 스크립트"""
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Any
@@ -14,6 +15,11 @@ try:
 except ImportError:
     print("Error: 'datasets' 패키지가 필요합니다. pip install datasets huggingface_hub")
     sys.exit(1)
+
+try:
+    from huggingface_hub import HfApi
+except ImportError:
+    HfApi = None
 
 # 부모 디렉토리를 sys.path에 추가
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -50,6 +56,198 @@ class HFUploader:
         self.config = get_config()
         self.batch_state_file = self.data_dir / "hf_batch_state.json"
         self.batch_state = self._load_batch_state()
+        self.hf_token = self._resolve_hf_token()
+        self._maybe_disable_xet()
+
+    @staticmethod
+    def _resolve_hf_token() -> str | None:
+        """환경변수에서 HF 토큰을 조회."""
+        return (
+            os.getenv("HF_TOKEN")
+            or os.getenv("HUGGINGFACE_HUB_TOKEN")
+            or os.getenv("HUGGINGFACE_TOKEN")
+        )
+
+    @staticmethod
+    def _maybe_disable_xet() -> None:
+        """컨테이너/프록시 환경에서 Xet CAS 경로를 우회하기 위해 기본 비활성화."""
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+    @staticmethod
+    def _is_repo_not_found_error(error: Exception) -> bool:
+        return "404" in str(error) or "not found" in str(error).lower()
+
+    def ensure_repo(self, private: bool = False, exist_ok: bool = True, dry_run: bool = False) -> bool:
+        """HF dataset repository 생성/검증."""
+        if dry_run:
+            logger.info(f"[DRY RUN] HF 리포지터리 생성 스킵: {self.repo_id}")
+            return True
+        if HfApi is None:
+            logger.error("huggingface_hub 패키지가 없어 리포지터리 생성 불가")
+            return False
+        if not self.hf_token:
+            logger.error("HF_TOKEN 환경변수가 없어 리포지터리 생성 불가")
+            return False
+        try:
+            api = HfApi(token=self.hf_token)
+            try:
+                info = api.repo_info(repo_id=self.repo_id, repo_type="dataset", token=self.hf_token)
+                logger.info(
+                    "기존 dataset 리포지터리 감지: %s (private=%s) - 기존 공개/비공개 설정을 유지합니다.",
+                    self.repo_id,
+                    getattr(info, "private", "unknown"),
+                )
+                return True
+            except Exception as repo_info_error:
+                if not self._is_repo_not_found_error(repo_info_error):
+                    logger.warning(f"리포지터리 조회 실패, 생성 시도 진행: {repo_info_error}")
+            api.create_repo(
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                private=private,
+                exist_ok=exist_ok,
+                token=self.hf_token,
+            )
+            logger.info(f"HF dataset 리포지터리 준비 완료: {self.repo_id}")
+            return True
+        except Exception as e:
+            logger.error(f"HF 리포지터리 생성 실패 ({self.repo_id}): {e}")
+            return False
+
+    def ensure_bucket(self, bucket_id: str, private: bool = False, exist_ok: bool = True, dry_run: bool = False) -> bool:
+        """HF storage bucket 생성/검증."""
+        if dry_run:
+            logger.info(f"[DRY RUN] HF bucket 생성 스킵: {bucket_id}")
+            return True
+        if HfApi is None:
+            logger.error("huggingface_hub 패키지가 없어 bucket 생성 불가")
+            return False
+        if not self.hf_token:
+            logger.error("HF_TOKEN 환경변수가 없어 bucket 생성 불가")
+            return False
+        try:
+            api = HfApi(token=self.hf_token)
+            try:
+                info = api.bucket_info(bucket_id=bucket_id, token=self.hf_token)
+                logger.info(
+                    "기존 bucket 감지: %s (private=%s) - 기존 공개/비공개 설정을 유지합니다.",
+                    bucket_id,
+                    getattr(info, "private", "unknown"),
+                )
+                return True
+            except Exception as bucket_info_error:
+                if not self._is_repo_not_found_error(bucket_info_error):
+                    logger.warning(f"bucket 조회 실패, 생성 시도 진행: {bucket_info_error}")
+            api.create_bucket(
+                bucket_id=bucket_id,
+                private=private,
+                exist_ok=exist_ok,
+                token=self.hf_token,
+            )
+            logger.info(f"HF bucket 준비 완료: {bucket_id}")
+            return True
+        except Exception as e:
+            logger.error(f"HF bucket 생성 실패 ({bucket_id}): {e}")
+            return False
+
+    def sync_artifacts_to_bucket(
+        self,
+        bucket_id: str,
+        source_dir: str | Path,
+        bucket_prefix: str = "searchThema",
+        dry_run: bool = False,
+        allow_repo_fallback: bool = True,
+    ) -> bool:
+        """로컬 아티팩트를 HF bucket으로 동기화."""
+        if HfApi is None:
+            logger.error("huggingface_hub 패키지가 없어 bucket sync 불가")
+            return False
+        if not self.hf_token:
+            logger.error("HF_TOKEN 환경변수가 없어 bucket sync 불가")
+            return False
+        source_dir = str(source_dir)
+        dest = f"hf://buckets/{bucket_id}/{bucket_prefix}".rstrip("/")
+        try:
+            api = HfApi(token=self.hf_token)
+            plan = api.sync_bucket(source=source_dir, dest=dest, token=self.hf_token, dry_run=True)
+            logger.info(f"Bucket sync dry-run: uploads={len([op for op in plan.operations if op.action == 'upload'])}")
+            if dry_run:
+                logger.info("[DRY RUN] bucket sync apply 스킵")
+                return True
+            api.sync_bucket(source=source_dir, dest=dest, token=self.hf_token)
+            logger.info(f"Bucket sync 완료: {source_dir} -> {dest}")
+            return True
+        except Exception as e:
+            logger.error(f"Bucket sync 실패 ({source_dir} -> {dest}): {e}")
+            if not allow_repo_fallback:
+                return False
+            logger.warning("Bucket sync 실패로 repo upload_folder fallback 시도")
+            return self.upload_artifacts_via_repo(source_dir=source_dir, path_in_repo=bucket_prefix, dry_run=dry_run)
+
+    def upload_artifacts_via_repo(self, source_dir: str | Path, path_in_repo: str = "searchThema", dry_run: bool = False) -> bool:
+        """bucket sync 실패 시 dataset repo 업로드 fallback."""
+        if HfApi is None:
+            logger.error("huggingface_hub 패키지가 없어 repo fallback 불가")
+            return False
+        if not self.hf_token:
+            logger.error("HF_TOKEN 환경변수가 없어 repo fallback 불가")
+            return False
+        if dry_run:
+            logger.info(f"[DRY RUN] repo upload fallback 스킵: {self.repo_id} <- {source_dir}")
+            return True
+        try:
+            api = HfApi(token=self.hf_token)
+            if not self.ensure_repo(dry_run=False):
+                return False
+            commit_info = api.upload_folder(
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                folder_path=str(source_dir),
+                path_in_repo=path_in_repo,
+                token=self.hf_token,
+                commit_message=f"fallback upload: {path_in_repo}",
+            )
+            logger.info(f"Repo fallback 업로드 완료: {commit_info.commit_url}")
+            return True
+        except Exception as e:
+            logger.error(f"Repo fallback 업로드 실패: {e}")
+            logger.warning("Repo fallback 2차 시도: metadata만 업로드")
+            try:
+                commit_info = api.upload_folder(
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    folder_path=str(source_dir),
+                    path_in_repo=path_in_repo,
+                    token=self.hf_token,
+                    allow_patterns=["metadata/**"],
+                    commit_message=f"fallback metadata-only: {path_in_repo}",
+                )
+                logger.info(f"Repo metadata-only 업로드 완료: {commit_info.commit_url}")
+                logger.warning("PDF 업로드는 실패했지만 metadata 업로드는 완료되었습니다.")
+                return True
+            except Exception as metadata_error:
+                logger.error(f"Repo metadata-only 업로드도 실패: {metadata_error}")
+                return False
+
+    def validate_artifacts(self) -> Dict[str, int]:
+        """업로드 대상 아티팩트 존재 여부 점검."""
+        summary = {"found_files": 0, "found_items": 0, "missing_files": 0}
+        for source in SOURCES:
+            categories = ["공직자재산공개"] if source == "pety" else CATEGORIES
+            for category in categories:
+                items = self.load_metadata_items(source, category)
+                if items:
+                    summary["found_files"] += 1
+                    summary["found_items"] += len(items)
+                else:
+                    summary["missing_files"] += 1
+        logger.info(
+            "아티팩트 점검 결과: 파일 %s개, 아이템 %s개, 누락 %s개",
+            summary["found_files"],
+            summary["found_items"],
+            summary["missing_files"],
+        )
+        return summary
 
     def _load_batch_state(self) -> Dict[str, int]:
         """업로드 상태 로드"""
@@ -166,6 +364,8 @@ class HFUploader:
             return True
 
         try:
+            if not self.hf_token:
+                raise RuntimeError("HF_TOKEN 환경변수가 필요합니다.")
             dataset = datasets.Dataset.from_dict({
                 key: [r[key] for r in records]
                 for key in records[0].keys()
@@ -176,7 +376,7 @@ class HFUploader:
                 repo_id=self.repo_id,
                 config_name=config_name,
                 split="main",
-                private=False,
+                token=self.hf_token,
             )
             logger.info(f"HF 업로드 완료: {config_name}")
             return True
@@ -223,14 +423,79 @@ class HFUploader:
     is_flag=True,
     help='드라이런 모드'
 )
-def main(repo_id: str, data_dir: str, dry_run: bool) -> None:
+@click.option(
+    '--create-repo',
+    is_flag=True,
+    help='HF dataset 리포지터리를 생성(또는 존재 확인)합니다.'
+)
+@click.option(
+    '--private',
+    is_flag=True,
+    help='--create-repo 사용 시 private 저장소로 생성합니다.'
+)
+@click.option(
+    '--use-bucket-sync',
+    is_flag=True,
+    help='datasets push 대신 HF storage bucket sync를 사용합니다.'
+)
+@click.option(
+    '--bucket-id',
+    default='yakdoli/peti-artifacts',
+    help='HF bucket ID (예: yakdoli/peti-artifacts)'
+)
+@click.option(
+    '--bucket-prefix',
+    default='searchThema',
+    help='bucket 내 업로드 prefix 경로'
+)
+@click.option(
+    '--disable-repo-fallback',
+    is_flag=True,
+    help='bucket sync 실패 시 repo fallback 업로드를 비활성화합니다.'
+)
+def main(
+    repo_id: str,
+    data_dir: str,
+    dry_run: bool,
+    create_repo: bool,
+    private: bool,
+    use_bucket_sync: bool,
+    bucket_id: str,
+    bucket_prefix: str,
+    disable_repo_fallback: bool,
+) -> None:
     """HuggingFace 데이터셋 업로드"""
     logger.info(f"HuggingFace 업로드 시작")
     logger.info(f"  리포지터리: {repo_id}")
     logger.info(f"  데이터 디렉토리: {data_dir}")
-    logger.info(f"  드라이런: {dry_run}")
-
     uploader = HFUploader(repo_id, data_dir)
+    logger.info(f"  드라이런: {dry_run}")
+    logger.info(f"  리포지터리 생성: {create_repo}")
+    logger.info(f"  bucket sync: {use_bucket_sync}")
+    logger.info(f"  HF_TOKEN 설정됨: {'yes' if uploader.hf_token else 'no'}")
+    logger.info(f"  HF_HUB_DISABLE_XET: {os.getenv('HF_HUB_DISABLE_XET', 'unset')}")
+    uploader.validate_artifacts()
+
+    if use_bucket_sync:
+        if not uploader.ensure_bucket(bucket_id=bucket_id, private=private, dry_run=dry_run):
+            logger.error("bucket 준비 실패로 업로드를 중단합니다.")
+            raise SystemExit(1)
+        source_dir = Path(data_dir).parent
+        ok = uploader.sync_artifacts_to_bucket(
+            bucket_id=bucket_id,
+            source_dir=source_dir,
+            bucket_prefix=bucket_prefix,
+            dry_run=dry_run,
+            allow_repo_fallback=not disable_repo_fallback,
+        )
+        if not ok:
+            raise SystemExit(1)
+        logger.info("HuggingFace bucket sync 종료")
+        return
+
+    if create_repo and not uploader.ensure_repo(private=private, dry_run=dry_run):
+        logger.error("리포지터리 준비 실패로 업로드를 중단합니다.")
+        raise SystemExit(1)
     uploader.upload_all(dry_run=dry_run)
 
     logger.info(f"HuggingFace 업로드 종료")

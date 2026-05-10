@@ -96,7 +96,7 @@ class BaseCrawler(ABC):
             raise RuntimeError("viewer_path가 없습니다.")
 
         viewer_url = self._viewer_url_for_item(item, viewer_path)
-        prefers_browser = not await self._is_host_reachable("gwanbo.go.kr", 443)
+        prefers_browser = (not await self._is_host_reachable("gwanbo.go.kr", 443)) and hasattr(context, "new_page")
         if prefers_browser:
             self.logger.info("네트워크 진단 결과 gwanbo.go.kr 직연결 불가, 브라우저 우선 경로 사용")
             viewer_html = await self._fetch_viewer_html_via_browser_page(context, viewer_url)
@@ -206,7 +206,7 @@ class BaseCrawler(ABC):
         sha256 = hashlib.sha256()
         size = 0
 
-        prefers_browser = not await self._is_host_reachable("gwanbo.go.kr", 443)
+        prefers_browser = (not await self._is_host_reachable("gwanbo.go.kr", 443)) and hasattr(context, "new_page")
         if prefers_browser:
             self.logger.info("네트워크 진단 결과 gwanbo.go.kr 직연결 불가, 브라우저 fetch 우선 경로 사용")
             body = await self._download_pdf_body_via_browser_page(context, download_url, form_data)
@@ -217,7 +217,7 @@ class BaseCrawler(ABC):
         else:
             try:
                 timeout = aiohttp.ClientTimeout(total=max(self.request_timeout, 60))
-                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers, trust_env=True) as session:
                     async with session.post(download_url, data=form_data) as response:
                         if response.status != 200:
                             raise RuntimeError(f"PDF 요청 실패: HTTP {response.status}")
@@ -232,6 +232,8 @@ class BaseCrawler(ABC):
                 if "Network is unreachable" not in str(http_error) and "ENETUNREACH" not in str(http_error):
                     raise
                 self.logger.warning("PDF aiohttp 다운로드 ENETUNREACH 감지, APIRequestContext fallback 시도")
+                if not hasattr(context, "request"):
+                    raise RuntimeError(f"PDF HTTP 다운로드 실패(ENETUNREACH) 및 fallback 불가: {http_error}") from http_error
                 response = await context.request.post(download_url, form=form_data, timeout=self.timeout_ms)
                 if response.status != 200:
                     raise RuntimeError(f"PDF 요청 실패(APIRequestContext): HTTP {response.status}")
@@ -311,8 +313,18 @@ class BaseCrawler(ABC):
             await writer.wait_closed()
             self._connectivity_cache[cache_key] = True
         except (OSError, socket.gaierror, TimeoutError):
-            self._connectivity_cache[cache_key] = False
+            self._connectivity_cache[cache_key] = await self._probe_host_via_http(host)
         return self._connectivity_cache[cache_key]
+
+    async def _probe_host_via_http(self, host: str) -> bool:
+        """프록시/게이트웨이 환경을 고려한 HTTP 연결 가능성 점검."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.head(f"https://{host}") as response:
+                    return response.status < 500
+        except Exception:
+            return False
 
     def _pdf_path_for_item(self, item: Dict[str, Any]) -> Path:
         date_text = item.get("date", "unknown")
