@@ -46,6 +46,7 @@ def crawler_factory(tmp_data_dir: Path, mock_config: Mock):
     ):
         metadata_manager = Mock(name="MetadataManager")
         metadata_manager.items = {}
+        metadata_manager.load_item.return_value = None
         state = Mock(name="CrawlState")
         state.is_search_thema_completed.return_value = False
 
@@ -122,7 +123,7 @@ def test_skip_existing_item(crawler_factory, search_thema_item: dict) -> None:
 def test_skip_completed_pdf(crawler_factory, search_thema_item: dict, tmp_path: Path) -> None:
     crawler, metadata_manager, _state = crawler_factory(metadata_only=False)
     pdf_path = tmp_path / "completed.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4")
+    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
     metadata_manager.get_item.return_value = {
         "id": search_thema_item["stored_toc_seq"],
         "pdf": {"status": "completed", "path": str(pdf_path)},
@@ -169,3 +170,19 @@ def test_resume_interrupted_crawl(crawler_factory, search_thema_item: dict) -> N
     args = state.mark_search_thema_completed.call_args.args
     assert args[0:3] == ("2024", "정부공직자윤리위원회", "metadata")
     assert args[3]["saved_items"] == 1
+
+
+def test_failed_combination_remains_resumable(crawler_factory) -> None:
+    crawler, _metadata_manager, state = crawler_factory(
+        metadata_only=False,
+        years=["2024"],
+        institutions=["정부공직자윤리위원회"],
+        save_indexes=False,
+    )
+
+    with patch.object(crawler, "fetch_items", new=AsyncMock(side_effect=RuntimeError("Server disconnected"))):
+        stats = asyncio.run(crawler.crawl())
+
+    assert stats["completed_combinations"] == 0
+    assert stats["failed_combinations"] == 1
+    state.mark_search_thema_completed.assert_not_called()

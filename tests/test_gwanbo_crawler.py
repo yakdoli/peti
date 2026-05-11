@@ -134,7 +134,7 @@ def test_viewer_url_construction(crawler: GwanboCrawler) -> None:
 
 def test_existing_pdf_is_complete(crawler: GwanboCrawler, tmp_path: Path) -> None:
     complete_pdf = tmp_path / "complete.pdf"
-    complete_pdf.write_bytes(b"%PDF-1.7")
+    complete_pdf.write_bytes(b"%PDF-1.7\n%%EOF\n")
     empty_pdf = tmp_path / "empty.pdf"
     empty_pdf.write_bytes(b"")
 

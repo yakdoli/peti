@@ -1,6 +1,7 @@
 """메타데이터 관리 모듈"""
 
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from datetime import datetime
@@ -18,7 +19,7 @@ except ImportError:
 class MetadataManager:
     """메타데이터 관리 클래스"""
 
-    def __init__(self, metadata_dir: str | Path | None = None):
+    def __init__(self, metadata_dir: str | Path | None = None, load_existing: bool = True):
         """메타데이터 매니저를 초기화합니다."""
         self.config = get_config()
         self.logger = setup_logger(__name__)
@@ -29,7 +30,8 @@ class MetadataManager:
         self.items_dir.mkdir(parents=True, exist_ok=True)
         
         self.items: Dict[str, Dict[str, Any]] = {}
-        self.load_existing_metadata()
+        if load_existing:
+            self.load_existing_metadata()
 
     def load_existing_metadata(self) -> None:
         """기존 메타데이터를 로드합니다."""
@@ -96,6 +98,22 @@ class MetadataManager:
         """
         return self.items.get(str(item_id))
 
+    def load_item(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """항목별 JSON 메타데이터 하나만 지연 로드합니다."""
+        item_path = self.get_item_path(item)
+        if not item_path.exists():
+            return None
+        try:
+            with open(item_path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            item_id = loaded.get('id')
+            if item_id:
+                self.items[str(item_id)] = loaded
+            return loaded
+        except Exception as e:
+            self.logger.warning(f"항목 메타데이터 로드 오류 ({item_path}): {e}")
+            return None
+
     def get_all_items(self) -> List[Dict[str, Any]]:
         """
         모든 메타데이터 항목을 반환합니다.
@@ -121,7 +139,7 @@ class MetadataManager:
         """메타데이터를 파일에 저장합니다."""
         metadata_file = self.metadata_dir / 'metadata.json'
         try:
-            temp_file = metadata_file.with_suffix('.json.tmp')
+            temp_file = self._temp_path(metadata_file)
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.items, f, ensure_ascii=False, indent=2, default=str)
             temp_file.replace(metadata_file)
@@ -137,7 +155,7 @@ class MetadataManager:
         
         item_path = self.get_item_path(item)
         item_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = item_path.with_suffix('.json.tmp')
+        temp_file = self._temp_path(item_path)
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(item, f, ensure_ascii=False, indent=2, default=str)
         temp_file.replace(item_path)
@@ -177,7 +195,7 @@ class MetadataManager:
         for category, items in categories.items():
             category_file = self.metadata_dir / f"metadata_{self._safe_filename(str(category))}.json"
             try:
-                temp_file = category_file.with_suffix('.json.tmp')
+                temp_file = self._temp_path(category_file)
                 with open(temp_file, 'w', encoding='utf-8') as f:
                     json.dump(items, f, ensure_ascii=False, indent=2, default=str)
                 temp_file.replace(category_file)
@@ -236,3 +254,7 @@ class MetadataManager:
     @staticmethod
     def _safe_filename(value: str) -> str:
         return re.sub(r'[^0-9A-Za-z가-힣_.-]+', '_', value).strip('._') or 'unknown'
+
+    @staticmethod
+    def _temp_path(target: Path) -> Path:
+        return target.with_name(f"{target.name}.{os.getpid()}.tmp")

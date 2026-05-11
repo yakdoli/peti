@@ -44,6 +44,12 @@ except ImportError:
     aiohttp = _MissingAioHttp()
 
 
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+
 class BaseCrawler(ABC):
     """Common crawler helpers shared across themed crawler implementations."""
 
@@ -95,6 +101,11 @@ class BaseCrawler(ABC):
                         last = 0.0
 
                 now = time.monotonic()
+                # monotonic timestamps are not valid across process/host restarts.
+                # If a persisted stamp is ahead of the current monotonic clock,
+                # treat it as stale instead of sleeping for hours.
+                if last < 0.0 or last > now:
+                    last = 0.0
                 delay = max(0.0, min_interval - (now - last))
                 if jitter > 0:
                     delay += random.uniform(0, jitter)
@@ -149,7 +160,7 @@ class BaseCrawler(ABC):
             raise RuntimeError("viewer_path가 없습니다.")
 
         viewer_url = self._viewer_url_for_item(item, viewer_path)
-        prefers_browser = (not await self._is_host_reachable("gwanbo.go.kr", 443)) and hasattr(context, "new_page")
+        prefers_browser = hasattr(context, "new_page") and not await self._is_host_reachable("gwanbo.go.kr", 443)
         if prefers_browser:
             self.logger.info("네트워크 진단 결과 gwanbo.go.kr 직연결 불가, 브라우저 우선 경로 사용")
             viewer_html = await self._fetch_viewer_html_via_browser_page(context, viewer_url)
@@ -252,13 +263,7 @@ class BaseCrawler(ABC):
     async def _fetch_viewer_html_via_http(self, context: Any, viewer_url: str) -> str:
         cookies = await context.cookies(self.viewer_base_url)
         cookie_header = "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in cookies)
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Referer": self.viewer_base_url,
-        }
+        headers = self._browser_headers(self.viewer_base_url)
         if cookie_header:
             headers["Cookie"] = cookie_header
 
@@ -309,28 +314,29 @@ class BaseCrawler(ABC):
     ) -> Dict[str, Any]:
         cookies = await context.cookies(self.viewer_base_url)
         cookie_header = "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in cookies)
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Referer": self.viewer_base_url,
-        }
+        headers = self._browser_headers(self.viewer_base_url)
         if cookie_header:
             headers["Cookie"] = cookie_header
 
-        temp_path = pdf_path.with_suffix(".pdf.tmp")
+        task_id = id(asyncio.current_task()) if asyncio.current_task() else os.getpid()
+        temp_path = pdf_path.with_name(f"{pdf_path.stem}.{os.getpid()}.{task_id}.pdf.tmp")
         sha256 = hashlib.sha256()
         size = 0
+        used_request_fallback = False
 
-        prefers_browser = (not await self._is_host_reachable("gwanbo.go.kr", 443)) and hasattr(context, "new_page")
-        if prefers_browser:
-            self.logger.info("네트워크 진단 결과 gwanbo.go.kr 직연결 불가, 브라우저 fetch 우선 경로 사용")
-            body = await self._download_pdf_body_via_browser_page(context, download_url, form_data)
+        def _write_pdf_body(body: bytes) -> None:
+            nonlocal sha256, size
+            sha256 = hashlib.sha256()
             with open(temp_path, "wb") as f:
                 f.write(body)
             sha256.update(body)
             size = len(body)
+
+        prefers_browser = hasattr(context, "new_page") and not await self._is_host_reachable("gwanbo.go.kr", 443)
+        if prefers_browser:
+            self.logger.info("네트워크 진단 결과 gwanbo.go.kr 직연결 불가, 브라우저 fetch 우선 경로 사용")
+            body = await self._download_pdf_body_via_browser_page(context, download_url, form_data)
+            _write_pdf_body(body)
         else:
             try:
                 timeout = aiohttp.ClientTimeout(total=max(self.request_timeout, 60))
@@ -349,24 +355,36 @@ class BaseCrawler(ABC):
             except Exception as http_error:
                 if not self._should_fallback_pdf_http_error(http_error):
                     raise
-                self.logger.warning(f"PDF aiohttp 다운로드 실패, APIRequestContext fallback 시도: {http_error}")
                 if not hasattr(context, "request"):
+                    self.logger.warning(
+                        "PDF aiohttp 다운로드 실패, APIRequestContext fallback 불가"
+                        f"(HTTP-only context): {http_error}"
+                    )
                     raise RuntimeError(f"PDF HTTP 다운로드 실패 및 fallback 불가: {http_error}") from http_error
+                self.logger.warning(f"PDF aiohttp 다운로드 실패, APIRequestContext fallback 시도: {http_error}")
                 await self._throttle_network()
                 response = await context.request.post(download_url, form=form_data, timeout=self.timeout_ms)
                 if response.status != 200:
                     raise RuntimeError(f"PDF 요청 실패(APIRequestContext): HTTP {response.status}")
                 body = await response.body()
-                with open(temp_path, "wb") as f:
-                    f.write(body)
-                sha256.update(body)
-                size = len(body)
+                _write_pdf_body(body)
+                used_request_fallback = True
 
-        with open(temp_path, "rb") as f:
-            header = f.read(5)
-        if header != b"%PDF-":
+            if not self._pdf_file_is_complete(temp_path):
+                temp_path.unlink(missing_ok=True)
+                if not hasattr(context, "request") or used_request_fallback:
+                    raise RuntimeError("다운로드 결과가 완전한 PDF가 아닙니다.")
+                self.logger.warning("PDF aiohttp 다운로드 결과가 불완전, APIRequestContext fallback 시도")
+                await self._throttle_network()
+                response = await context.request.post(download_url, form=form_data, timeout=self.timeout_ms)
+                if response.status != 200:
+                    raise RuntimeError(f"PDF 요청 실패(APIRequestContext): HTTP {response.status}")
+                body = await response.body()
+                _write_pdf_body(body)
+
+        if not self._pdf_file_is_complete(temp_path):
             temp_path.unlink(missing_ok=True)
-            raise RuntimeError("다운로드 결과가 PDF가 아닙니다.")
+            raise RuntimeError("다운로드 결과가 완전한 PDF가 아닙니다.")
 
         temp_path.replace(pdf_path)
         return {
@@ -391,6 +409,11 @@ class BaseCrawler(ABC):
             "Not enough data to satisfy",
             "Not enough data for satisfy transfer length",
             "invalid literal for int() with base 16",
+            "HTTP 401",
+            "HTTP 403",
+            "HTTP 500",
+            "HTTP 502",
+            "HTTP 503",
         )
         return any(marker in text for marker in transient_markers)
 
@@ -459,11 +482,22 @@ class BaseCrawler(ABC):
         """프록시/게이트웨이 환경을 고려한 HTTP 연결 가능성 점검."""
         try:
             timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                headers=self._browser_headers(f"https://{host}/"),
+                trust_env=True,
+            ) as session:
                 async with session.head(f"https://{host}") as response:
                     return response.status < 500
         except Exception:
             return False
+
+    @staticmethod
+    def _browser_headers(referer: str) -> Dict[str, str]:
+        return {
+            "User-Agent": os.getenv("GWANBO_USER_AGENT", DEFAULT_BROWSER_USER_AGENT),
+            "Referer": referer,
+        }
 
     def _pdf_path_for_item(self, item: Dict[str, Any]) -> Path:
         date_text = item.get("date", "unknown")
@@ -474,7 +508,22 @@ class BaseCrawler(ABC):
     def _existing_pdf_is_complete(self, item: Dict[str, Any]) -> bool:
         pdf = item.get("pdf", {}) or {}
         path = Path(str(pdf.get("path", "")))
-        return pdf.get("status") == "completed" and path.exists() and path.stat().st_size > 0
+        return pdf.get("status") == "completed" and self._pdf_file_is_complete(path)
+
+    @staticmethod
+    def _pdf_file_is_complete(path: Path) -> bool:
+        try:
+            size = path.stat().st_size
+            if size <= 0:
+                return False
+            with open(path, "rb") as handle:
+                if handle.read(5) != b"%PDF-":
+                    return False
+                tail_size = min(size, 4096)
+                handle.seek(-tail_size, os.SEEK_END)
+                return b"%%EOF" in handle.read(tail_size)
+        except OSError:
+            return False
 
     def _parse_date(self, date_text: str) -> datetime:
         text = (date_text or "").strip()

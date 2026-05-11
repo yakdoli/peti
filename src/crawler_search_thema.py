@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import parse_qs, urljoin, urlparse
 
 try:
@@ -84,6 +85,8 @@ class SearchThemaCrawler(BaseCrawler):
         state_file: str | None = None,
         headless: bool = True,
         concurrency: int = 5,
+        use_browser: bool = True,
+        preload_metadata: bool = True,
     ):
         super().__init__()
 
@@ -102,6 +105,18 @@ class SearchThemaCrawler(BaseCrawler):
         self.save_indexes = save_indexes
         self.headless = headless
         self.concurrency = concurrency
+        self.use_browser = use_browser
+        self.preload_metadata = preload_metadata
+        self.browser_fallback_enabled = os.getenv("SEARCH_BROWSER_FALLBACK", "1").lower() not in {"0", "false", "no"}
+        self._browser_fallback_sem = asyncio.Semaphore(
+            max(1, int(os.getenv("SEARCH_BROWSER_FALLBACK_CONCURRENCY", "1")))
+        )
+        self.session_pool_size = max(0, int(os.getenv("SEARCH_SESSION_POOL_SIZE", "4")))
+        self.session_pool_path = Path(
+            os.getenv("SEARCH_SESSION_POOL_PATH", "artifacts/state/searchthema_session_pool.json")
+        )
+        self.direct_pdf_download = os.getenv("SEARCH_DIRECT_PDF_DOWNLOAD", "1").lower() not in {"0", "false", "no"}
+        self._session_pool_lock = asyncio.Lock()
         self._limit_reached = False
         self.search_api_url = search_config.get("search_api_url", "https://gwanbo.go.kr/SearchRestApi.jsp")
         self.theme_info_url = search_config.get("theme_info_url", "https://gwanbo.go.kr/user/search/getThemeBaseInfo.do")
@@ -122,7 +137,8 @@ class SearchThemaCrawler(BaseCrawler):
         self.chunk_size = int(download_config.get("chunk_size", 8192))
         self.pdf_dir = self._search_thema_pdf_dir(download_config.get("pdf_directory", "artifacts/pdfs"))
         self.metadata_manager = MetadataManager(
-            self._search_thema_metadata_dir(download_config.get("metadata_directory", "artifacts/metadata"))
+            self._search_thema_metadata_dir(download_config.get("metadata_directory", "artifacts/metadata")),
+            load_existing=preload_metadata,
         )
         self.state = CrawlState(state_file or self.config.get("state.file", "artifacts/state/crawl_state.json"))
 
@@ -135,6 +151,7 @@ class SearchThemaCrawler(BaseCrawler):
             "downloaded_pdfs": 0,
             "failed_downloads": 0,
             "completed_combinations": 0,
+            "failed_combinations": 0,
             "skipped_combinations": 0,
             "start_time": None,
             "end_time": None,
@@ -147,7 +164,7 @@ class SearchThemaCrawler(BaseCrawler):
         self.logger.info("=" * 60)
 
         try:
-            if context is None and HAS_PLAYWRIGHT:
+            if context is None and HAS_PLAYWRIGHT and self.use_browser:
                 assert async_playwright is not None
                 try:
                     async with async_playwright() as playwright:
@@ -193,13 +210,26 @@ class SearchThemaCrawler(BaseCrawler):
                     self.logger.error(f"조합 수집 실패 {year}/{institution}: {exc}")
                     combination_stats = {"year": str(year), "institution": self._institution_state_value(institution), "error": str(exc)}
                 if not self._limit_reached and self.limit is None:
-                    self.state.mark_search_thema_completed(
-                        str(year),
-                        self._institution_state_value(institution),
-                        self._state_mode(),
-                        combination_stats,
-                    )
-                    self.stats["completed_combinations"] += 1
+                    if self._combination_completed_successfully(combination_stats):
+                        self.state.mark_search_thema_completed(
+                            str(year),
+                            self._institution_state_value(institution),
+                            self._state_mode(),
+                            combination_stats,
+                        )
+                        self.stats["completed_combinations"] += 1
+                    else:
+                        self.stats["failed_combinations"] += 1
+                        self.logger.warning(
+                            "미완료 조합은 resume 대상에 유지합니다: "
+                            f"{year} / {self._institution_state_value(institution)}"
+                        )
+
+    @staticmethod
+    def _combination_completed_successfully(stats: Dict[str, Any]) -> bool:
+        if stats.get("error"):
+            return False
+        return int(stats.get("failed_downloads") or 0) == 0
 
     async def _prime_browser_session(self, context: BrowserContext) -> None:
         page = await context.new_page()
@@ -331,6 +361,7 @@ class SearchThemaCrawler(BaseCrawler):
 
         last_error: Exception | None = None
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+        headers = self._search_api_headers()
         for attempt in range(1, self.max_retries + 1):
             try:
                 response_json: Dict[str, Any] | None = None
@@ -350,7 +381,7 @@ class SearchThemaCrawler(BaseCrawler):
                             f"Playwright 요청 실패, aiohttp 폴백 시도: {browser_error}"
                         )
                 if response_json is None:
-                    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                    async with aiohttp.ClientSession(timeout=timeout, headers=headers, trust_env=True) as session:
                         await self._throttle_network()
                         async with session.post(self.search_api_url, data=payload) as response:
                             if response.status != 200:
@@ -424,6 +455,8 @@ class SearchThemaCrawler(BaseCrawler):
             return False
         existing = self.metadata_manager.get_item(self.get_item_id(item))
         if not existing:
+            existing = self.metadata_manager.load_item(item)
+        if not existing:
             return False
         if self.metadata_only or self._existing_pdf_is_complete(existing):
             self.metadata_manager.add_item(existing)
@@ -454,27 +487,83 @@ class SearchThemaCrawler(BaseCrawler):
 
     async def _download_item_pdf_once(self, context: Any, item: Dict[str, Any]) -> Dict[str, Any]:
         self._prepare_pdf_item(item)
+        session_entry: Dict[str, Any] | None = None
         try:
-            result = await self._download_pdf_via_http(item)
-        except Exception as http_error:
             if context is None:
+                if self._direct_pdf_download_request(item) is None:
+                    session_entry = await self._next_session_entry(create_missing=True)
+                result = await self._download_pdf_via_http(item, session_entry)
+            else:
+                result = await self._download_pdf_via_http(item)
+        except Exception as http_error:
+            if context is None and self._should_retry_with_session_pool(http_error):
+                recovered_with_session = False
+                if session_entry is None:
+                    session_entry = await self._next_session_entry(create_missing=True)
+                    if session_entry is not None:
+                        try:
+                            result = await self._download_pdf_via_http(item, session_entry)
+                            recovered_with_session = True
+                        except Exception as session_http_error:
+                            http_error = session_http_error
+                if not recovered_with_session:
+                    failed_session_id = self._session_entry_id(session_entry)
+                    try:
+                        result = await self._download_with_session_pool_round_robin(
+                            item,
+                            http_error,
+                            exclude_session_ids={failed_session_id} if failed_session_id else None,
+                        )
+                    except Exception as pool_error:
+                        if not self._should_refresh_session_with_browser(pool_error):
+                            raise RuntimeError(f"SearchThema HTTP PDF 다운로드 실패: {pool_error}") from pool_error
+                        self.logger.warning(
+                            "SearchThema 세션 ID 라운드로빈 실패, 브라우저 세션 갱신 fallback 시도: "
+                            f"{pool_error}"
+                        )
+                        result = await self._download_with_fresh_browser_session(
+                            item,
+                            pool_error,
+                            failed_session_id=failed_session_id,
+                        )
+            elif context is None and self._should_refresh_session_with_browser(http_error):
+                self.logger.warning(f"SearchThema HTTP PDF 다운로드 실패, 브라우저 세션 갱신 fallback 시도: {http_error}")
+                result = await self._download_with_fresh_browser_session(item, http_error)
+            elif context is None:
                 raise RuntimeError(f"SearchThema HTTP PDF 다운로드 실패: {http_error}") from http_error
-            self.logger.warning(f"SearchThema HTTP PDF 다운로드 실패, Playwright fallback 시도: {http_error}")
-            result = await self._download_with_playwright_fallback(context, item)
+            else:
+                self.logger.warning(f"SearchThema HTTP PDF 다운로드 실패, Playwright fallback 시도: {http_error}")
+                result = await self._download_with_playwright_fallback(context, item)
 
-        item["pdf"].update(result)
+        pdf = item.setdefault("pdf", {})
+        pdf.pop("error", None)
+        pdf.pop("failed_at", None)
+        pdf.update(result)
         item["status"] = "completed"
         self.stats["downloaded_pdfs"] += 1
         self.logger.info(f"SearchThema PDF 다운로드 완료: {result['path']}")
         return item
 
-    async def _download_pdf_via_http(self, item: Dict[str, Any]) -> Dict[str, Any]:
+    async def _download_pdf_via_http(
+        self,
+        item: Dict[str, Any],
+        session_entry: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         viewer_path = item.get("viewer_path", "")
         viewer_url = self._viewer_url_for_item(item, str(viewer_path))
         pdf_path = self._pdf_path_for_item(item)
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
 
+        cookies = self._session_entry_cookies(session_entry)
+        direct_request = self._direct_pdf_download_request(item)
+        if direct_request is not None:
+            download_url, form_data = direct_request
+            return await self._download_pdf_stream(self._cookie_context(cookies), download_url, form_data, pdf_path)
+
         headers = self._browser_headers(viewer_url)
+        cookie_header = self._cookie_header(cookies)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
         timeout = aiohttp.ClientTimeout(total=max(self.request_timeout, 60))
         async with aiohttp.ClientSession(timeout=timeout, headers=headers, trust_env=True) as session:
             await self._throttle_network()
@@ -484,11 +573,18 @@ class SearchThemaCrawler(BaseCrawler):
                 viewer_html = await viewer_response.text()
 
             download_url, form_data = self._extract_download_request(viewer_html, item)
-            return await self._download_pdf_stream(self._empty_cookie_context(), download_url, form_data, pdf_path)
+            return await self._download_pdf_stream(self._cookie_context(cookies), download_url, form_data, pdf_path)
 
     async def _download_with_playwright_fallback(self, context: Any, item: Dict[str, Any]) -> Dict[str, Any]:
         viewer_path = item.get("viewer_path", "")
         viewer_url = self._viewer_url_for_item(item, str(viewer_path))
+        direct_request = self._direct_pdf_download_request(item)
+        if direct_request is not None:
+            download_url, form_data = direct_request
+            pdf_path = self._pdf_path_for_item(item)
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            return await self._download_pdf_stream(context, download_url, form_data, pdf_path)
+
         await self._throttle_network()
         viewer_response = await context.request.get(viewer_url, timeout=self.timeout_ms)
         if viewer_response.status != 200:
@@ -499,6 +595,386 @@ class SearchThemaCrawler(BaseCrawler):
         pdf_path = self._pdf_path_for_item(item)
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         return await self._download_pdf_stream(context, download_url, form_data, pdf_path)
+
+    def _direct_pdf_download_request(self, item: Dict[str, Any]) -> tuple[str, Dict[str, str]] | None:
+        if not self.direct_pdf_download:
+            return None
+        toc_id = str(item.get("toc_id") or item.get("stored_toc_seq") or "").strip()
+        if not toc_id:
+            return None
+        return urljoin(self.viewer_base_url, "user/common/ofcttCntntDownload.do"), {"cntnt_seq_no": toc_id}
+
+    def _should_refresh_session_with_browser(self, error: Exception) -> bool:
+        if not self.browser_fallback_enabled or not HAS_PLAYWRIGHT or async_playwright is None:
+            return False
+        return self._is_session_retry_candidate(error)
+
+    def _should_retry_with_session_pool(self, error: Exception) -> bool:
+        return self.session_pool_size > 0 and self.browser_fallback_enabled and self._is_session_retry_candidate(error)
+
+    @staticmethod
+    def _is_session_retry_candidate(error: Exception) -> bool:
+        text = str(error)
+        markers = (
+            "HTTP 401",
+            "HTTP 403",
+            "HTTP 500",
+            "HTTP 502",
+            "HTTP 503",
+            "Connection reset by peer",
+            "Server disconnected",
+            "socket hang up",
+            "PDF 다운로드 엔드포인트를 찾을 수 없습니다",
+            "다운로드 결과가 PDF가 아닙니다",
+            "다운로드 결과가 완전한 PDF가 아닙니다",
+            "SearchThema 세션 ID 라운드로빈 재시도 대상이 없습니다",
+            "SearchThema 세션 ID 라운드로빈 fallback 실패",
+        )
+        return any(marker in text for marker in markers)
+
+    async def _download_with_session_pool_round_robin(
+        self,
+        item: Dict[str, Any],
+        error: Exception,
+        exclude_session_ids: Set[str] | None = None,
+    ) -> Dict[str, Any]:
+        sessions = await self._ensure_session_pool()
+        if not sessions:
+            raise RuntimeError(f"사용 가능한 SearchThema 세션 ID가 없습니다: {error}") from error
+
+        exclude_session_ids = exclude_session_ids or set()
+        last_error: Exception = error
+        tried_session_ids: Set[str] = set()
+        attempts = 0
+
+        for _ in range(len(sessions)):
+            session_entry = await self._next_session_entry(create_missing=False)
+            session_id = self._session_entry_id(session_entry)
+            if not session_entry or not session_id or session_id in tried_session_ids:
+                continue
+            tried_session_ids.add(session_id)
+            if session_id in exclude_session_ids:
+                continue
+
+            attempts += 1
+            self.logger.warning(
+                "SearchThema 세션 ID 라운드로빈 PDF 재시도 "
+                f"{attempts}/{len(sessions)}: {self._mask_session_id(session_id)}"
+            )
+            try:
+                return await self._download_pdf_via_http(item, session_entry)
+            except Exception as exc:
+                last_error = exc
+                self.logger.warning(
+                    "SearchThema 세션 ID 라운드로빈 재시도 실패 "
+                    f"{self._mask_session_id(session_id)}: {exc}"
+                )
+
+        if attempts == 0:
+            raise RuntimeError("SearchThema 세션 ID 라운드로빈 재시도 대상이 없습니다.") from error
+        raise RuntimeError(f"SearchThema 세션 ID 라운드로빈 fallback 실패({attempts}회): {last_error}") from last_error
+
+    async def _download_with_fresh_browser_session(
+        self,
+        item: Dict[str, Any],
+        error: Exception,
+        failed_session_id: str | None = None,
+    ) -> Dict[str, Any]:
+        if async_playwright is None:
+            raise RuntimeError(f"Playwright fallback 불가: {error}") from error
+
+        async with self._browser_fallback_sem:
+            self.logger.info("headless Chrome으로 SearchThema 세션/JSESSIONID 갱신")
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=self.headless)
+                browser_context = await browser.new_context(
+                    ignore_https_errors=True,
+                    extra_http_headers=self._browser_headers(self.viewer_base_url),
+                )
+                try:
+                    await self._prime_browser_session(browser_context)
+                    try:
+                        session_entry = await self._session_entry_from_browser_context(browser_context)
+                    except Exception as session_error:
+                        self.logger.warning(f"갱신된 브라우저 세션에서 JSESSIONID 추출 실패: {session_error}")
+                        if not self.use_browser:
+                            raise RuntimeError(
+                                f"HTTP-only 모드에서 JSESSIONID 갱신 실패: {session_error}"
+                            ) from session_error
+                        return await self._download_with_playwright_fallback(browser_context, item)
+
+                    await self._replace_session_entry(session_entry, failed_session_id=failed_session_id)
+                    try:
+                        return await self._download_pdf_via_http(item, session_entry)
+                    except Exception as refreshed_http_error:
+                        if not self.use_browser:
+                            raise RuntimeError(
+                                "HTTP-only 모드 세션 갱신 후 HTTP 재시도 실패: "
+                                f"{refreshed_http_error}"
+                            ) from refreshed_http_error
+                        self.logger.warning(
+                            "갱신 세션 ID HTTP 재시도 실패, Playwright context fallback 시도: "
+                            f"{refreshed_http_error}"
+                        )
+                        return await self._download_with_playwright_fallback(browser_context, item)
+                finally:
+                    await browser_context.close()
+                    await browser.close()
+
+    async def _ensure_session_pool(self) -> List[Dict[str, Any]]:
+        if self.session_pool_size <= 0:
+            return []
+
+        sessions = await self._read_session_pool_entries()
+        if len(sessions) >= self.session_pool_size:
+            return sessions
+        if not self.browser_fallback_enabled or not HAS_PLAYWRIGHT or async_playwright is None:
+            return sessions
+
+        async with self._session_pool_lock:
+            create_lock = await self._acquire_session_pool_create_lock()
+            try:
+                while True:
+                    sessions = await self._read_session_pool_entries()
+                    if len(sessions) >= self.session_pool_size:
+                        return sessions
+                    try:
+                        session_entry = await self._create_browser_session_entry()
+                    except Exception as exc:
+                        self.logger.warning(f"SearchThema 세션 ID 풀 생성 실패: {exc}")
+                        return sessions
+                    added = await asyncio.to_thread(self._append_session_entry_if_room_sync, session_entry)
+                    if not added:
+                        return await self._read_session_pool_entries()
+            finally:
+                await asyncio.to_thread(fcntl.flock, create_lock.fileno(), fcntl.LOCK_UN)
+                create_lock.close()
+
+    async def _next_session_entry(self, create_missing: bool) -> Dict[str, Any] | None:
+        if self.session_pool_size <= 0:
+            return None
+        if create_missing:
+            await self._ensure_session_pool()
+        async with self._session_pool_lock:
+            return await asyncio.to_thread(self._next_session_entry_sync)
+
+    async def _create_browser_session_entry(self) -> Dict[str, Any]:
+        if async_playwright is None:
+            raise RuntimeError("Playwright fallback 불가")
+
+        async with self._browser_fallback_sem:
+            self.logger.info("headless Chrome으로 SearchThema 세션/JSESSIONID 생성")
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=self.headless)
+                browser_context = await browser.new_context(
+                    ignore_https_errors=True,
+                    extra_http_headers=self._browser_headers(self.viewer_base_url),
+                )
+                try:
+                    await self._prime_browser_session(browser_context)
+                    return await self._session_entry_from_browser_context(browser_context)
+                finally:
+                    await browser_context.close()
+                    await browser.close()
+
+    async def _session_entry_from_browser_context(self, context: BrowserContext) -> Dict[str, Any]:
+        cookies = self._normalize_cookies(await context.cookies(self.viewer_base_url))
+        session_id = self._session_id_from_cookies(cookies)
+        if not session_id:
+            raise RuntimeError("JSESSIONID 쿠키를 찾을 수 없습니다.")
+        return {
+            "id": session_id,
+            "cookies": cookies,
+            "created_at": datetime.now().isoformat(),
+        }
+
+    async def _read_session_pool_entries(self) -> List[Dict[str, Any]]:
+        pool = await asyncio.to_thread(self._read_session_pool_locked_sync)
+        return list(pool.get("sessions") or [])
+
+    def _read_session_pool_locked_sync(self) -> Dict[str, Any]:
+        def _op() -> Dict[str, Any]:
+            return self._read_session_pool_unlocked()
+
+        return self._with_session_pool_file_lock_sync(_op)
+
+    def _next_session_entry_sync(self) -> Dict[str, Any] | None:
+        def _op() -> Dict[str, Any] | None:
+            pool = self._read_session_pool_unlocked()
+            sessions = list(pool.get("sessions") or [])
+            if not sessions:
+                return None
+            cursor = int(pool.get("cursor") or 0) % len(sessions)
+            session_entry = sessions[cursor]
+            pool["cursor"] = (cursor + 1) % len(sessions)
+            pool["sessions"] = sessions
+            self._write_session_pool_unlocked(pool)
+            return session_entry
+
+        return self._with_session_pool_file_lock_sync(_op)
+
+    def _append_session_entry_if_room_sync(self, session_entry: Dict[str, Any]) -> bool:
+        def _op() -> bool:
+            pool = self._read_session_pool_unlocked()
+            sessions = list(pool.get("sessions") or [])
+            session_id = self._session_entry_id(session_entry)
+            for index, current in enumerate(sessions):
+                if self._session_entry_id(current) == session_id:
+                    sessions[index] = session_entry
+                    pool["sessions"] = sessions[: self.session_pool_size]
+                    self._write_session_pool_unlocked(pool)
+                    return True
+            if len(sessions) >= self.session_pool_size:
+                return False
+            sessions.append(session_entry)
+            pool["sessions"] = sessions
+            self._write_session_pool_unlocked(pool)
+            return True
+
+        return self._with_session_pool_file_lock_sync(_op)
+
+    async def _replace_session_entry(
+        self,
+        session_entry: Dict[str, Any],
+        failed_session_id: str | None = None,
+    ) -> None:
+        async with self._session_pool_lock:
+            await asyncio.to_thread(self._replace_session_entry_sync, session_entry, failed_session_id)
+
+    def _replace_session_entry_sync(
+        self,
+        session_entry: Dict[str, Any],
+        failed_session_id: str | None = None,
+    ) -> None:
+        def _op() -> None:
+            pool = self._read_session_pool_unlocked()
+            sessions = list(pool.get("sessions") or [])
+            replacement_index: int | None = None
+            if failed_session_id:
+                for index, current in enumerate(sessions):
+                    if self._session_entry_id(current) == failed_session_id:
+                        replacement_index = index
+                        break
+
+            if replacement_index is None:
+                session_id = self._session_entry_id(session_entry)
+                for index, current in enumerate(sessions):
+                    if self._session_entry_id(current) == session_id:
+                        replacement_index = index
+                        break
+
+            if replacement_index is not None:
+                sessions[replacement_index] = session_entry
+            elif len(sessions) < self.session_pool_size:
+                sessions.append(session_entry)
+            elif sessions:
+                replacement_index = int(pool.get("cursor") or 0) % len(sessions)
+                sessions[replacement_index] = session_entry
+                pool["cursor"] = (replacement_index + 1) % len(sessions)
+            else:
+                sessions.append(session_entry)
+
+            pool["sessions"] = sessions[: self.session_pool_size]
+            self._write_session_pool_unlocked(pool)
+
+        self._with_session_pool_file_lock_sync(_op)
+
+    def _read_session_pool_unlocked(self) -> Dict[str, Any]:
+        if not self.session_pool_path.exists():
+            return {"cursor": 0, "sessions": []}
+        try:
+            raw = json.loads(self.session_pool_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"cursor": 0, "sessions": []}
+        sessions = [
+            session
+            for session in raw.get("sessions", [])
+            if isinstance(session, dict) and self._session_entry_id(session) and self._session_entry_cookies(session)
+        ]
+        return {
+            "cursor": int(raw.get("cursor") or 0),
+            "sessions": sessions[: self.session_pool_size],
+        }
+
+    def _write_session_pool_unlocked(self, pool: Dict[str, Any]) -> None:
+        self.session_pool_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.session_pool_path.with_name(f"{self.session_pool_path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(
+            json.dumps(pool, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self.session_pool_path)
+
+    def _with_session_pool_file_lock_sync(self, callback: Any) -> Any:
+        self.session_pool_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.session_pool_path.with_suffix(self.session_pool_path.suffix + ".lock")
+        with open(lock_path, "w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                return callback()
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    async def _acquire_session_pool_create_lock(self) -> Any:
+        self.session_pool_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.session_pool_path.with_suffix(self.session_pool_path.suffix + ".create.lock")
+        lock_file = open(lock_path, "w", encoding="utf-8")
+        try:
+            await asyncio.to_thread(fcntl.flock, lock_file.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            lock_file.close()
+            raise
+        return lock_file
+
+    @staticmethod
+    def _normalize_cookies(cookies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized = []
+        for cookie in cookies:
+            name = str(cookie.get("name") or "")
+            value = str(cookie.get("value") or "")
+            if not name or not value:
+                continue
+            normalized.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": str(cookie.get("domain") or "gwanbo.go.kr"),
+                    "path": str(cookie.get("path") or "/"),
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _session_id_from_cookies(cookies: List[Dict[str, Any]]) -> str:
+        for cookie in cookies:
+            if str(cookie.get("name") or "").upper() == "JSESSIONID":
+                return str(cookie.get("value") or "")
+        return ""
+
+    @staticmethod
+    def _session_entry_id(session_entry: Dict[str, Any] | None) -> str:
+        if not session_entry:
+            return ""
+        return str(session_entry.get("id") or SearchThemaCrawler._session_id_from_cookies(
+            SearchThemaCrawler._session_entry_cookies(session_entry)
+        ))
+
+    @staticmethod
+    def _session_entry_cookies(session_entry: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+        if not session_entry:
+            return []
+        cookies = session_entry.get("cookies") or []
+        return [cookie for cookie in cookies if isinstance(cookie, dict)]
+
+    @staticmethod
+    def _cookie_header(cookies: List[Dict[str, Any]]) -> str:
+        return "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in cookies if cookie.get("name"))
+
+    @staticmethod
+    def _mask_session_id(session_id: str) -> str:
+        if len(session_id) <= 10:
+            return "***"
+        return f"{session_id[:6]}...{session_id[-4:]}"
 
     async def _response_json(self, response: Any) -> Dict[str, Any]:
         headers = getattr(response, "headers", None)
@@ -551,7 +1027,15 @@ class SearchThemaCrawler(BaseCrawler):
             response_html = await response.text()
         else:
             timeout = aiohttp.ClientTimeout(total=self.request_timeout)
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            headers = self._browser_headers(self.pety_list_url)
+            headers.update(
+                {
+                    "Accept": "text/html, */*",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": self.viewer_base_url.rstrip("/"),
+                }
+            )
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers, trust_env=True) as session:
                 await self._throttle_network()
                 async with session.post(self.pety_list_url.replace("petyList", "petyListAjax"), data=payload) as response:
                     if response.status != 200:
@@ -596,21 +1080,30 @@ class SearchThemaCrawler(BaseCrawler):
 
     @staticmethod
     def _browser_headers(referer: str) -> Dict[str, str]:
-        return {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Referer": referer,
-        }
+        return BaseCrawler._browser_headers(referer)
+
+    def _search_api_headers(self) -> Dict[str, str]:
+        headers = self._browser_headers(self.theme_info_url)
+        headers.update(
+            {
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": self.viewer_base_url.rstrip("/"),
+            }
+        )
+        return headers
 
     @staticmethod
     def _empty_cookie_context():
-        class _EmptyCookieContext:
-            async def cookies(self, base_url: str) -> List[Dict[str, str]]:
-                return []
+        return SearchThemaCrawler._cookie_context([])
 
-        return _EmptyCookieContext()
+    @staticmethod
+    def _cookie_context(cookies: List[Dict[str, Any]]):
+        class _CookieContext:
+            async def cookies(self, base_url: str) -> List[Dict[str, Any]]:
+                return cookies
+
+        return _CookieContext()
 
     @staticmethod
     def _configured_years(search_config: Dict[str, Any]) -> List[str]:

@@ -31,6 +31,9 @@ def test_cli_help(capsys: pytest.CaptureFixture[str]) -> None:
         "--no-resume",
         "--rebuild-index",
         "--state-file",
+        "--no-save-indexes",
+        "--http-only",
+        "--no-preload-metadata",
     ):
         assert option in output
 
@@ -46,6 +49,9 @@ def test_cli_default_args() -> None:
     assert args.headed is False
     assert args.rebuild_index is False
     assert args.state_file is None
+    assert args.save_indexes is True
+    assert args.http_only is False
+    assert args.no_preload_metadata is False
 
 
 def test_cli_year_only() -> None:
@@ -69,3 +75,21 @@ def test_cli_institution_filter() -> None:
     assert args.metadata_only is True
     assert args.limit == 3
     assert args.resume is False
+
+
+def test_cli_can_disable_index_saves() -> None:
+    args = parse_args(["--no-save-indexes"])
+
+    assert args.save_indexes is False
+
+
+def test_cli_can_disable_browser_context() -> None:
+    args = parse_args(["--http-only"])
+
+    assert args.http_only is True
+
+
+def test_cli_can_disable_metadata_preload() -> None:
+    args = parse_args(["--no-preload-metadata"])
+
+    assert args.no_preload_metadata is True

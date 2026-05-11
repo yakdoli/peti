@@ -1,4 +1,5 @@
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock
@@ -80,7 +81,7 @@ def test_viewer_url_content_id_toc_id(tmp_path: Path) -> None:
 def test_existing_pdf_complete_true(tmp_path: Path) -> None:
     crawler = DummyCrawler(tmp_path)
     complete_pdf = tmp_path / "complete.pdf"
-    complete_pdf.write_bytes(b"%PDF-1.7")
+    complete_pdf.write_bytes(b"%PDF-1.7\n%%EOF\n")
 
     assert crawler._existing_pdf_is_complete({"pdf": {"status": "completed", "path": str(complete_pdf)}}) is True
 
@@ -96,7 +97,7 @@ def test_existing_pdf_incomplete_missing_file(tmp_path: Path) -> None:
 def test_annotate_ocr_strategy_text_pdf(tmp_path: Path) -> None:
     crawler = DummyCrawler(tmp_path)
     pdf_path = tmp_path / "text.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4 dummy")
+    pdf_path.write_bytes(b"%PDF-1.4 dummy\n%%EOF\n")
 
     item = {"id": "1", "ocr": {"status": "pending", "ready_dir": "", "extracted_metadata": {}}}
     crawler._extract_text_pdf_metadata = Mock(return_value={"text_extractable": True, "pages": 1})
@@ -111,7 +112,7 @@ def test_annotate_ocr_strategy_text_pdf(tmp_path: Path) -> None:
 def test_annotate_ocr_strategy_image_pdf(tmp_path: Path) -> None:
     crawler = DummyCrawler(tmp_path)
     pdf_path = tmp_path / "image.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4 dummy")
+    pdf_path.write_bytes(b"%PDF-1.4 dummy\n%%EOF\n")
 
     item = {"id": "2", "ocr": {"status": "pending", "ready_dir": "", "extracted_metadata": {}}}
     crawler._extract_text_pdf_metadata = Mock(return_value={"text_extractable": False, "pages": 1})
@@ -169,7 +170,7 @@ def test_extract_text_pdf_metadata_handles_invalid_file(tmp_path: Path) -> None:
 def test_extract_text_pdf_metadata_handles_reader_page_errors(tmp_path: Path, monkeypatch) -> None:
     crawler = DummyCrawler(tmp_path)
     pdf_path = tmp_path / "xref_weird.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4 dummy")
+    pdf_path.write_bytes(b"%PDF-1.4 dummy\n%%EOF\n")
 
     class BrokenReader:
         metadata = {}
@@ -185,3 +186,18 @@ def test_extract_text_pdf_metadata_handles_reader_page_errors(tmp_path: Path, mo
     assert result["text_extractable"] is False
     assert result["pages"] == 0
     assert "invalid literal" in result["error"]
+
+
+def test_throttle_ignores_future_monotonic_stamp(tmp_path: Path) -> None:
+    lock_dir = tmp_path / "network"
+    lock_dir.mkdir()
+    (lock_dir / "gwanbo.last").write_text(str(time.monotonic() + 3600), encoding="utf-8")
+
+    started = time.monotonic()
+    BaseCrawler._throttle_network_sync(lock_dir, 0.01, 0)
+
+    assert time.monotonic() - started < 1
+
+
+def test_pdf_http_500_is_fallback_candidate() -> None:
+    assert BaseCrawler._should_fallback_pdf_http_error(RuntimeError("PDF 요청 실패: HTTP 500")) is True

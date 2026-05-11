@@ -23,5 +23,5 @@ logs/
 venv/
 __pycache__/
 *.pyc
-
+sync_work/
 .venv/
