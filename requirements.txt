@@ -11,6 +11,10 @@ aiohttp
 aiofiles
 pillow
 PyPDF2
+pdfplumber
+markitdown[pdf]
+PyMuPDF
+pytesseract
 python-dotenv
 playwright
 PyYAML

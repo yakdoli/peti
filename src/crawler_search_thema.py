@@ -557,8 +557,13 @@ class SearchThemaCrawler(BaseCrawler):
         cookies = self._session_entry_cookies(session_entry)
         direct_request = self._direct_pdf_download_request(item)
         if direct_request is not None:
-            download_url, form_data = direct_request
-            return await self._download_pdf_stream(self._cookie_context(cookies), download_url, form_data, pdf_path)
+            return await self._download_pdf_stream_with_issue_fallback(
+                self._cookie_context(cookies),
+                item,
+                pdf_path,
+                direct_request,
+                "content_pdf_direct",
+            )
 
         headers = self._browser_headers(viewer_url)
         cookie_header = self._cookie_header(cookies)
@@ -572,18 +577,29 @@ class SearchThemaCrawler(BaseCrawler):
                     raise RuntimeError(f"뷰어 요청 실패: HTTP {viewer_response.status}")
                 viewer_html = await viewer_response.text()
 
-            download_url, form_data = self._extract_download_request(viewer_html, item)
-            return await self._download_pdf_stream(self._cookie_context(cookies), download_url, form_data, pdf_path)
+            request = self._extract_download_request(viewer_html, item)
+            return await self._download_pdf_stream_with_issue_fallback(
+                self._cookie_context(cookies),
+                item,
+                pdf_path,
+                request,
+                self._download_method_name(request),
+            )
 
     async def _download_with_playwright_fallback(self, context: Any, item: Dict[str, Any]) -> Dict[str, Any]:
         viewer_path = item.get("viewer_path", "")
         viewer_url = self._viewer_url_for_item(item, str(viewer_path))
         direct_request = self._direct_pdf_download_request(item)
         if direct_request is not None:
-            download_url, form_data = direct_request
             pdf_path = self._pdf_path_for_item(item)
             pdf_path.parent.mkdir(parents=True, exist_ok=True)
-            return await self._download_pdf_stream(context, download_url, form_data, pdf_path)
+            return await self._download_pdf_stream_with_issue_fallback(
+                context,
+                item,
+                pdf_path,
+                direct_request,
+                "content_pdf_direct",
+            )
 
         await self._throttle_network()
         viewer_response = await context.request.get(viewer_url, timeout=self.timeout_ms)
@@ -591,10 +607,16 @@ class SearchThemaCrawler(BaseCrawler):
             raise RuntimeError(f"Playwright 뷰어 요청 실패: HTTP {viewer_response.status}")
         viewer_html = await viewer_response.text()
 
-        download_url, form_data = self._extract_download_request(viewer_html, item)
+        request = self._extract_download_request(viewer_html, item)
         pdf_path = self._pdf_path_for_item(item)
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
-        return await self._download_pdf_stream(context, download_url, form_data, pdf_path)
+        return await self._download_pdf_stream_with_issue_fallback(
+            context,
+            item,
+            pdf_path,
+            request,
+            self._download_method_name(request),
+        )
 
     def _direct_pdf_download_request(self, item: Dict[str, Any]) -> tuple[str, Dict[str, str]] | None:
         if not self.direct_pdf_download:
@@ -603,6 +625,60 @@ class SearchThemaCrawler(BaseCrawler):
         if not toc_id:
             return None
         return urljoin(self.viewer_base_url, "user/common/ofcttCntntDownload.do"), {"cntnt_seq_no": toc_id}
+
+    def _issue_pdf_download_request(self, item: Dict[str, Any]) -> tuple[str, Dict[str, str]] | None:
+        content_id = str(item.get("content_id") or "").strip()
+        if not content_id:
+            viewer_path = str(item.get("viewer_path") or item.get("stored_field_url") or "")
+            content_id = self._first_query_value(parse_qs(urlparse(viewer_path).query), "contentId")
+        if not content_id:
+            return None
+        return urljoin(self.viewer_base_url, "user/common/ofcttDownload.do"), {
+            "downType": "1",
+            "ofctt_seq_no": content_id,
+        }
+
+    def _download_method_name(self, request: tuple[str, Dict[str, str]]) -> str:
+        _url, form_data = request
+        if form_data.get("ofctt_seq_no"):
+            return "issue_pdf"
+        return "content_pdf"
+
+    async def _download_pdf_stream_with_issue_fallback(
+        self,
+        context: Any,
+        item: Dict[str, Any],
+        pdf_path: Path,
+        primary_request: tuple[str, Dict[str, str]],
+        primary_method: str,
+    ) -> Dict[str, Any]:
+        requests: list[tuple[str, tuple[str, Dict[str, str]]]] = [(primary_method, primary_request)]
+        issue_request = self._issue_pdf_download_request(item)
+        if issue_request is not None and issue_request != primary_request:
+            requests.append(("issue_pdf_fallback", issue_request))
+
+        last_error: Exception | None = None
+        for index, (method, (download_url, form_data)) in enumerate(requests):
+            target_path = self._issue_pdf_path_for_item(item) if method.startswith("issue_pdf") else pdf_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                result = await self._download_pdf_stream(context, download_url, form_data, target_path)
+                result["method"] = method
+                result["scope"] = "issue" if method.startswith("issue_pdf") else "content"
+                if last_error is not None:
+                    result["fallback_from"] = primary_method
+                    result["fallback_error"] = str(last_error)
+                return result
+            except Exception as exc:
+                last_error = exc
+                if index >= len(requests) - 1:
+                    raise
+                self.logger.warning(
+                    "SearchThema 본문 PDF 다운로드 실패, 전체 관보 PDF fallback 시도 "
+                    f"({self.get_item_id(item)}): {exc}"
+                )
+
+        raise RuntimeError("PDF 다운로드 요청 후보가 없습니다.")
 
     def _should_refresh_session_with_browser(self, error: Exception) -> bool:
         if not self.browser_fallback_enabled or not HAS_PLAYWRIGHT or async_playwright is None:
@@ -1050,6 +1126,12 @@ class SearchThemaCrawler(BaseCrawler):
         year = date_text[:4] if len(date_text) >= 4 else "unknown"
         date_key = date_text.replace("-", "") if len(date_text) == 10 else "unknown"
         return self.pdf_dir / year / date_key / f"{self._safe_filename(self.get_item_id(item))}.pdf"
+
+    def _issue_pdf_path_for_item(self, item: Dict[str, Any]) -> Path:
+        date_text = self._item_date(item)
+        year = date_text[:4] if len(date_text) >= 4 else "unknown"
+        date_key = date_text.replace("-", "") if len(date_text) == 10 else "unknown"
+        return self.pdf_dir.parent / "issue_pdfs" / year / date_key / f"{self._safe_filename(self.get_item_id(item))}.pdf"
 
     def _prepare_pdf_item(self, item: Dict[str, Any]) -> None:
         viewer_path = item.get("viewer_path") or item.get("stored_field_url") or ""

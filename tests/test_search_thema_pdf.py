@@ -92,6 +92,17 @@ def test_direct_pdf_request_from_toc_id(crawler: SearchThemaCrawler, search_them
     )
 
 
+def test_issue_pdf_request_from_content_id(crawler: SearchThemaCrawler, search_thema_item: dict) -> None:
+    crawler._prepare_pdf_item(search_thema_item)
+
+    issue_request = crawler._issue_pdf_download_request(search_thema_item)
+
+    assert issue_request == (
+        "https://gwanbo.go.kr/user/common/ofcttDownload.do",
+        {"downType": "1", "ofctt_seq_no": "I0000000000000001735535299326000"},
+    )
+
+
 def test_http_download_uses_direct_endpoint_without_viewer(
     crawler: SearchThemaCrawler,
     search_thema_item: dict,
@@ -116,6 +127,39 @@ def test_http_download_uses_direct_endpoint_without_viewer(
     assert stream.await_args.args[1] == "https://gwanbo.go.kr/user/common/ofcttCntntDownload.do"
     assert stream.await_args.args[2] == {"cntnt_seq_no": "I0000000000000001734498102442000"}
     assert result == direct_result
+
+
+def test_http_download_falls_back_to_issue_pdf(
+    crawler: SearchThemaCrawler,
+    search_thema_item: dict,
+) -> None:
+    crawler._prepare_pdf_item(search_thema_item)
+    fallback_result = {
+        "status": "completed",
+        "path": "issue.pdf",
+        "size_bytes": 10,
+        "sha256": "abc",
+        "downloaded_at": "2026-05-11T00:00:00",
+    }
+
+    with patch.object(
+        crawler,
+        "_download_pdf_stream",
+        new=AsyncMock(side_effect=[RuntimeError("PDF 요청 실패: HTTP 500"), fallback_result]),
+    ) as stream:
+        result = asyncio.run(crawler._download_pdf_via_http(search_thema_item))
+
+    assert stream.await_count == 2
+    assert stream.await_args_list[0].args[1] == "https://gwanbo.go.kr/user/common/ofcttCntntDownload.do"
+    assert stream.await_args_list[0].args[2] == {"cntnt_seq_no": "I0000000000000001734498102442000"}
+    assert stream.await_args_list[1].args[1] == "https://gwanbo.go.kr/user/common/ofcttDownload.do"
+    assert stream.await_args_list[1].args[2] == {
+        "downType": "1",
+        "ofctt_seq_no": "I0000000000000001735535299326000",
+    }
+    assert result["method"] == "issue_pdf_fallback"
+    assert result["fallback_from"] == "content_pdf_direct"
+    assert "HTTP 500" in result["fallback_error"]
 
 
 def test_pdf_path_generation_search_thema(crawler: SearchThemaCrawler, search_thema_item: dict, tmp_data_dir: Path) -> None:

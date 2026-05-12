@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -56,8 +57,9 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def load_sample_items(args: argparse.Namespace) -> list[Path]:
+def load_sample_items(args: argparse.Namespace) -> list[tuple[Path, dict[str, Any]]]:
     paths: list[Path] = [Path(value) for value in args.item]
+    manifest_rows: dict[str, dict[str, Any]] = {}
     manifest = Path(args.manifest)
     if manifest.exists():
         for line in manifest.read_text(encoding="utf-8").splitlines():
@@ -70,7 +72,10 @@ def load_sample_items(args: argparse.Namespace) -> list[Path]:
             item_path = Path(str(row.get("item_path") or ""))
             if item_path.exists() and item_path not in paths:
                 paths.append(item_path)
-    return paths[: args.sample_limit]
+            if item_path.exists():
+                manifest_rows[str(item_path)] = row
+                manifest_rows[str(item_path.resolve())] = row
+    return [(path, manifest_rows.get(str(path)) or manifest_rows.get(str(path.resolve())) or {}) for path in paths[: args.sample_limit]]
 
 
 def viewer_url_for_item(item: dict[str, Any]) -> str:
@@ -98,6 +103,68 @@ def extract_download_request(viewer_html: str, item: dict[str, Any]) -> tuple[st
         return urljoin(BASE_URL, issue_match.group(1)), {"downType": "1", "ofctt_seq_no": content_id}
 
     raise RuntimeError("PDF download endpoint was not found in viewer HTML")
+
+
+def direct_download_request(item: dict[str, Any]) -> tuple[str, dict[str, str]] | None:
+    toc_id = str(item.get("toc_id") or item.get("stored_toc_seq") or item.get("keyword_toc_seq") or "").strip()
+    if not toc_id:
+        return None
+    return urljoin(BASE_URL, "user/common/ofcttCntntDownload.do"), {"cntnt_seq_no": toc_id}
+
+
+def pdf_file_is_complete(path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return False
+        with path.open("rb") as handle:
+            if handle.read(5) != b"%PDF-":
+                return False
+            tail_size = min(size, 4096)
+            handle.seek(-tail_size, os.SEEK_END)
+            return b"%%EOF" in handle.read(tail_size)
+    except OSError:
+        return False
+
+
+def local_pdf_summary(item: dict[str, Any]) -> dict[str, Any]:
+    pdf = item.get("pdf") if isinstance(item.get("pdf"), dict) else {}
+    path_text = str((pdf or {}).get("path") or "").strip()
+    path = Path(path_text) if path_text else None
+    if path and not path.is_absolute():
+        path = Path.cwd() / path
+    return {
+        "metadata_status": (pdf or {}).get("status"),
+        "metadata_path": path_text,
+        "metadata_size_bytes": (pdf or {}).get("size_bytes"),
+        "metadata_error": (pdf or {}).get("error"),
+        "exists": bool(path and path.exists()),
+        "actual_size_bytes": path.stat().st_size if path and path.exists() else None,
+        "complete": pdf_file_is_complete(path) if path else False,
+    }
+
+
+def metadata_summary(item: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "id",
+        "toc_id",
+        "stored_toc_seq",
+        "keyword_toc_seq",
+        "content_id",
+        "stored_pdf_file_path",
+        "stored_file_size",
+        "stored_file_type",
+        "stored_service_yn",
+        "stored_field_url",
+        "viewer_path",
+        "date",
+        "title",
+        "stored_field_subject",
+        "stored_category_name",
+        "stored_organ_nm",
+        "status",
+    )
+    return {key: item.get(key) for key in keys if item.get(key) not in (None, "")}
 
 
 def summarize_pdf_body(body: bytes) -> dict[str, Any]:
@@ -269,17 +336,37 @@ async def post_pdf_browser_fetch(
     return record
 
 
-async def diagnose_item(context: BrowserContext, item_path: Path, timeout_ms: int) -> dict[str, Any]:
+async def diagnose_item(
+    context: BrowserContext,
+    item_path: Path,
+    timeout_ms: int,
+    manifest_row: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     item = load_json(item_path)
     viewer_url = viewer_url_for_item(item)
     record: dict[str, Any] = {
         "item_path": str(item_path),
+        "manifest_row": manifest_row or {},
         "id": str(item.get("id") or item.get("stored_toc_seq") or ""),
         "date": item.get("date"),
         "title": item.get("title") or item.get("stored_field_subject"),
         "stored_pdf_file_path": item.get("stored_pdf_file_path"),
         "viewer_url": viewer_url,
+        "metadata": metadata_summary(item),
+        "local_pdf": local_pdf_summary(item),
     }
+
+    direct_request = direct_download_request(item)
+    if direct_request is not None:
+        direct_url, direct_form_data = direct_request
+        record["metadata_direct_download_request"] = {"url": direct_url, "form_data": direct_form_data}
+        record["metadata_direct_api_download"] = await post_pdf_api(context.request, direct_url, direct_form_data, timeout_ms)
+        record["metadata_direct_browser_fetch_download"] = await post_pdf_browser_fetch(
+            context,
+            direct_url,
+            direct_form_data,
+            timeout_ms,
+        )
 
     viewer_info, viewer_html, network = await fetch_viewer_with_network(context, viewer_url, timeout_ms)
     record["viewer"] = viewer_info
@@ -332,15 +419,17 @@ async def main() -> None:
             }
             for cookie in await context.cookies(BASE_URL)
         ]
-        for item_path in sample_items:
-            report["items"].append(await diagnose_item(context, item_path, args.timeout_ms))
+        for item_path, manifest_row in sample_items:
+            report["items"].append(await diagnose_item(context, item_path, args.timeout_ms, manifest_row))
             await asyncio.sleep(0.2)
         await browser.close()
 
     output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(output_path)
-    print("id date viewer_status api_status api_bytes api_pdf browser_status browser_bytes browser_pdf")
+    print("id date direct_api_status direct_api_bytes direct_api_pdf viewer_status api_status api_bytes api_pdf browser_status browser_bytes browser_pdf")
     for item in report["items"]:
+        direct_api = item.get("metadata_direct_api_download") or {}
+        direct_pdf = direct_api.get("pdf") or {}
         api = item.get("api_request_download") or {}
         browser_fetch = item.get("browser_fetch_download") or {}
         api_pdf = api.get("pdf") or {}
@@ -348,6 +437,9 @@ async def main() -> None:
         print(
             item.get("id"),
             item.get("date"),
+            direct_api.get("status"),
+            direct_pdf.get("bytes"),
+            direct_pdf.get("starts_pdf") and direct_pdf.get("has_eof"),
             (item.get("viewer") or {}).get("status"),
             api.get("status"),
             api_pdf.get("bytes"),
