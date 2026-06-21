@@ -1,0 +1,33 @@
+{
+  "name": "peti crawler",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspaces/peti",
+  "postCreateCommand": ".devcontainer/setup.sh",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": [
+          "tests"
+        ],
+        "files.exclude": {
+          "**/__pycache__": true,
+          "artifacts": true,
+          "datasets": true,
+          "data": true,
+          "logs": true
+        }
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-playwright.playwright"
+      ]
+    }
+  }
+}

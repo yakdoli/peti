@@ -51,6 +51,7 @@ try:
     from .config import get_config
     from .crawl_state import CrawlState
     from .metadata_manager import MetadataManager
+    from .metadata_schema import apply_item_schema
     from .pety_parser import parse_pety_list_page
     from .search_thema_parser import parse_search_thema_response
 except ImportError:
@@ -58,6 +59,7 @@ except ImportError:
     from config import get_config  # type: ignore[reportMissingImports]
     from crawl_state import CrawlState  # type: ignore[reportMissingImports]
     from metadata_manager import MetadataManager  # type: ignore[reportMissingImports]
+    from metadata_schema import apply_item_schema  # type: ignore[reportMissingImports]
     from pety_parser import parse_pety_list_page  # type: ignore[reportMissingImports]
     from search_thema_parser import parse_search_thema_response  # type: ignore[reportMissingImports]
 
@@ -474,9 +476,15 @@ class SearchThemaCrawler(BaseCrawler):
         prepared.setdefault("category", prepared.get("stored_category_name") or "")
         prepared.setdefault("agency", prepared.get("stored_organ_nm") or "")
         prepared.setdefault("url", self._viewer_url_for_item(prepared, prepared.get("viewer_path", "")))
+        prepared.setdefault("source_url", self.search_api_url)
         prepared.setdefault("ocr", {"status": "pending", "ready_dir": "", "extracted_metadata": {}})
         if not isinstance(prepared.get("pdf"), dict):
             prepared["pdf"] = {}
+        apply_item_schema(
+            prepared,
+            source_detail=self.theme,
+            source_endpoint=str(prepared.get("source") or "SearchRestApi"),
+        )
         return prepared
 
     def _viewer_url_for_item(self, item: Dict[str, Any], viewer_path: str) -> str:
@@ -539,6 +547,8 @@ class SearchThemaCrawler(BaseCrawler):
         pdf.pop("error", None)
         pdf.pop("failed_at", None)
         pdf.update(result)
+        if result.get("path"):
+            self._annotate_ocr_strategy(item, Path(str(result["path"])))
         item["status"] = "completed"
         self.stats["downloaded_pdfs"] += 1
         self.logger.info(f"SearchThema PDF 다운로드 완료: {result['path']}")

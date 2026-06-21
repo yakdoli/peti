@@ -12,6 +12,11 @@ from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
 
+try:
+    from .metadata_schema import apply_item_schema
+except ImportError:
+    from metadata_schema import apply_item_schema  # type: ignore[reportMissingImports]
+
 
 @dataclass
 class PetyListPage:
@@ -86,6 +91,7 @@ def parse_pety_list_page(response_html: str, list_url: str) -> PetyListPage:
                 "extracted_metadata": {},
             },
         }
+        apply_item_schema(item, source_detail="pety", source_endpoint="petyListAjax")
         items.append(item)
 
     return PetyListPage(total_count=total_count, total_pages=total_pages, items=items)

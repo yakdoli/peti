@@ -19,6 +19,13 @@ from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin
 
 try:
+    from .metadata_schema import sync_pdf_text_metadata
+    from .pdf_text_metadata import analyze_pdf_text
+except ImportError:
+    from metadata_schema import sync_pdf_text_metadata  # type: ignore[reportMissingImports]
+    from pdf_text_metadata import analyze_pdf_text  # type: ignore[reportMissingImports]
+
+try:
     import aiohttp  # type: ignore[reportMissingImports]
 except ImportError:
     class _MissingAioHttp:
@@ -193,62 +200,19 @@ class BaseCrawler(ABC):
 
     def _annotate_ocr_strategy(self, item: Dict[str, Any], pdf_path: Path) -> None:
         """텍스트 추출 가능 PDF는 OCR 없이 메타데이터를 생성하고, 이미지형 PDF만 OCR 대상으로 남긴다."""
-        ocr = item.setdefault("ocr", {})
         extracted = self._extract_text_pdf_metadata(pdf_path)
+        sync_pdf_text_metadata(item, extracted)
+        ocr = item["ocr"]
         if extracted.get("text_extractable"):
             ocr["status"] = "skipped_text_extractable"
             ocr["skip_reason"] = "text_extractable_pdf"
-            ocr["extracted_metadata"] = extracted
             return
 
         ocr.setdefault("status", "pending")
         ocr["skip_reason"] = ""
-        ocr["extracted_metadata"] = extracted
 
     def _extract_text_pdf_metadata(self, pdf_path: Path) -> Dict[str, Any]:
-        try:
-            reader = PdfReader(str(pdf_path))
-        except Exception as e:
-            return {"text_extractable": False, "error": str(e)}
-
-        text_pages = 0
-        total_chars = 0
-        page_count = 0
-        page_errors: List[Dict[str, Any]] = []
-        try:
-            pages = list(reader.pages)
-            page_count = len(pages)
-        except Exception as e:
-            return {
-                "text_extractable": False,
-                "pages": 0,
-                "text_pages": 0,
-                "total_chars": 0,
-                "error": str(e),
-                "generated_at": datetime.now().isoformat(),
-            }
-
-        for page_number, page in enumerate(pages, start=1):
-            try:
-                text = (page.extract_text() or "").strip()
-            except Exception as e:
-                page_errors.append({"page": page_number, "error": str(e)})
-                continue
-            if text:
-                text_pages += 1
-                total_chars += len(text)
-
-        result = {
-            "text_extractable": text_pages > 0,
-            "pages": page_count,
-            "text_pages": text_pages,
-            "total_chars": total_chars,
-            "pdf_metadata": {k: str(v) for k, v in (reader.metadata or {}).items()},
-            "generated_at": datetime.now().isoformat(),
-        }
-        if page_errors:
-            result["page_errors"] = page_errors
-        return result
+        return analyze_pdf_text(pdf_path, timeout_seconds=max(int(getattr(self, "request_timeout", 30) or 30), 1))
     async def _fetch_viewer_html_via_browser_page(self, context: Any, viewer_url: str) -> str:
         page = await context.new_page()
         try:

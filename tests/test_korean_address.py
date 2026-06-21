@@ -9,6 +9,7 @@ from src.korean_address import (
     GPSCoordinate,
     JusoAPIError,
     JusoClient,
+    convert_address,
     convert_historical_address,
     detect_address_type,
     gps_from_juso_coordinate,
@@ -37,6 +38,16 @@ class FakeSession:
     def get(self, url, *, params, timeout):
         self.calls.append({"url": url, "params": dict(params), "timeout": timeout})
         return FakeResponse(self.payloads.pop(0))
+
+
+class FakePlaceIndex:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def match_address(self, address, **kwargs):
+        self.calls.append({"address": address, "kwargs": dict(kwargs)})
+        return self.result
 
 
 def juso_payload(*items, common=None):
@@ -84,6 +95,27 @@ SAMPLE_JUSO = {
     "hemdNm": "명동",
 }
 
+LOCAL_ADDRESS_CANDIDATE = {
+    "record_id": "admin_area:juso_road_address_db:1114010300:juso-001",
+    "source_id": "juso_road_address_db",
+    "admin_code": "1114010300",
+    "name": "서울특별시청",
+    "area_kind": "road_address",
+    "parent_chain": ["서울특별시", "중구", "태평로1가"],
+    "valid_from": "2024-01-01",
+    "valid_to": None,
+    "confidence": 0.88,
+    "road_address": "서울특별시 중구 세종대로 110",
+    "jibun_address": "서울특별시 중구 태평로1가 31",
+    "zip_no": "04524",
+    "road_name_code": "111402005001",
+    "building_management_number": "1114010300100310000000001",
+    "representative_latitude": 37.5663,
+    "representative_longitude": 126.9779,
+    "representative_point_crs": "EPSG:4326",
+    "representative_point_source": "juso_entrance",
+}
+
 
 def test_normalize_korean_address_removes_postal_prefix_and_extra_spaces():
     assert (
@@ -121,6 +153,74 @@ def test_client_convert_uses_detected_sort_and_returns_both_address_systems():
     assert session.calls[0]["params"]["firstSort"] == "road"
     assert session.calls[0]["params"]["hstryYn"] == "Y"
     assert session.calls[0]["params"]["addInfoYn"] == "Y"
+
+
+def test_client_convert_uses_offline_place_index_before_api():
+    place_index = FakePlaceIndex(
+        {
+            "status": "matched",
+            "selected": LOCAL_ADDRESS_CANDIDATE,
+            "candidates": [LOCAL_ADDRESS_CANDIDATE],
+        }
+    )
+    session = FakeSession()
+    client = JusoClient(place_index=place_index, session=session)
+
+    result = client.convert("서울특별시 중구 세종대로 110", include_coordinates=True)
+
+    assert result.current_address == "서울특별시 중구 세종대로 110"
+    assert result.jibun_address == "서울특별시 중구 태평로1가 31"
+    assert result.gps_coordinate is not None
+    assert result.gps_coordinate.latitude == 37.5663
+    assert result.search.error_message == "offline_place_index"
+    assert session.calls == []
+    assert place_index.calls[0]["address"] == "서울특별시 중구 세종대로 110"
+
+
+def test_ambiguous_offline_place_index_does_not_fallback_without_opt_in():
+    first = {**LOCAL_ADDRESS_CANDIDATE, "admin_code": "2811010200", "parent_chain": ["인천광역시", "중구"]}
+    second = {**LOCAL_ADDRESS_CANDIDATE, "admin_code": "4215013300", "parent_chain": ["강원특별자치도", "강릉시"]}
+    place_index = FakePlaceIndex(
+        {
+            "status": "parent_chain_required",
+            "selected": None,
+            "candidates": [first, second],
+        }
+    )
+    session = FakeSession()
+    client = JusoClient(place_index=place_index, session=session)
+
+    result = client.convert("신촌동")
+
+    assert result.selected is None
+    assert result.current_address == ""
+    assert len(result.alternatives) == 2
+    assert session.calls == []
+
+
+def test_place_index_api_fallback_requires_explicit_opt_in():
+    place_index = FakePlaceIndex({"status": "not_found", "selected": None, "candidates": []})
+    session = FakeSession(juso_payload(SAMPLE_JUSO))
+    client = JusoClient(api_key="test-key", place_index=place_index, allow_api_fallback=True, session=session)
+
+    result = client.convert("서울특별시 중구 세종대로 110")
+
+    assert result.current_address == "서울특별시 중구 세종대로 110(태평로1가)"
+    assert len(session.calls) == 1
+
+
+def test_convert_address_wrapper_accepts_place_index():
+    place_index = FakePlaceIndex(
+        {
+            "status": "matched",
+            "selected": LOCAL_ADDRESS_CANDIDATE,
+            "candidates": [LOCAL_ADDRESS_CANDIDATE],
+        }
+    )
+
+    result = convert_address("서울특별시 중구 세종대로 110", place_index=place_index)
+
+    assert result.current_address == "서울특별시 중구 세종대로 110"
 
 
 def test_client_search_raises_on_juso_error_code():

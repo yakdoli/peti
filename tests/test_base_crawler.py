@@ -107,6 +107,7 @@ def test_annotate_ocr_strategy_text_pdf(tmp_path: Path) -> None:
     assert item["ocr"]["status"] == "skipped_text_extractable"
     assert item["ocr"]["skip_reason"] == "text_extractable_pdf"
     assert item["ocr"]["extracted_metadata"]["text_extractable"] is True
+    assert item["pdf_text"] == item["ocr"]["extracted_metadata"]
 
 
 def test_annotate_ocr_strategy_image_pdf(tmp_path: Path) -> None:
@@ -122,6 +123,7 @@ def test_annotate_ocr_strategy_image_pdf(tmp_path: Path) -> None:
     assert item["ocr"]["status"] == "pending"
     assert item["ocr"]["skip_reason"] == ""
     assert item["ocr"]["extracted_metadata"]["text_extractable"] is False
+    assert item["pdf_text"] == item["ocr"]["extracted_metadata"]
 
 
 def test_extract_text_pdf_metadata_detects_text(tmp_path: Path) -> None:
@@ -179,7 +181,7 @@ def test_extract_text_pdf_metadata_handles_reader_page_errors(tmp_path: Path, mo
         def pages(self):
             raise ValueError("invalid literal for int() with base 16: b'\\t'")
 
-    monkeypatch.setattr("src.base_crawler.PdfReader", lambda _path: BrokenReader())
+    monkeypatch.setattr("src.pdf_text_metadata.PdfReader", lambda _path: BrokenReader())
 
     result = crawler._extract_text_pdf_metadata(pdf_path)
 

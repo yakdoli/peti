@@ -211,9 +211,11 @@ def test_generate_source_layout_metadata_writes_fake_pdfplumber_sidecar(tmp_path
     aggregate = root / "searchThema" / "layout_metadata" / "metadata.json"
     metadata = json.loads(sidecar.read_text(encoding="utf-8"))
     index = json.loads(aggregate.read_text(encoding="utf-8"))
+    item = json.loads(item_path.read_text(encoding="utf-8"))
 
     assert summary["processed"] == 1
     assert summary["tables"] == 1
+    assert summary["updated_items"] == 1
     assert metadata["status"] == "ok"
     assert metadata["layout"]["metrics"]["table_count"] == 1
     assert metadata["tables"][0]["table_id"] == "p001-t001"
@@ -223,3 +225,8 @@ def test_generate_source_layout_metadata_writes_fake_pdfplumber_sidecar(tmp_path
         "col_3": "품목A",
     }
     assert index["2024/20240101/abc"]["table_count"] == 1
+    assert item["schema_version"] == "gwanbo.item.v1"
+    assert item["source_detail"] == "searchThema"
+    assert item["pdf_layout"]["status"] == "ok"
+    assert item["pdf_layout"]["table_count"] == 1
+    assert "tables" not in item["pdf_layout"]

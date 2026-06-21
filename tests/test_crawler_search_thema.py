@@ -97,7 +97,7 @@ def crawler(tmp_data_dir: Path, mock_config: Mock) -> SearchThemaCrawler:
         patch("crawler_search_thema.get_config", return_value=mock_config),
         patch("crawler_search_thema.setup_logger", return_value=Mock(name="logger")),
     ):
-        return SearchThemaCrawler()
+        return SearchThemaCrawler(preload_metadata=False)
 
 
 def test_build_query_year_only(crawler: SearchThemaCrawler) -> None:
@@ -108,6 +108,32 @@ def test_build_query_year_institution(crawler: SearchThemaCrawler) -> None:
     assert crawler._build_query(2024, "정부공직자윤리위원회") == (
         "unstored_field_subject:(2024 AND 정부공직자) AND keyword_category_order:(@@ORDER_NUM)"
     )
+
+
+def test_metadata_item_from_raw_applies_schema_envelope(crawler: SearchThemaCrawler) -> None:
+    item = crawler._metadata_item_from_raw(
+        {
+            "stored_toc_seq": "TOC-1",
+            "stored_field_url": "/ezpdf/customLayout.jsp?contentId=CONTENT-1&tocId=TOC-1",
+            "stored_field_year": "2024",
+            "stored_field_month": "1",
+            "stored_field_day": "2",
+            "stored_field_subject": "제목",
+        }
+    )
+
+    assert item["schema_version"] == "gwanbo.item.v1"
+    assert item["source"] == "SearchRestApi"
+    assert item["source_system"] == "gwanbo"
+    assert item["source_detail"] == "searchThema"
+    assert item["source_endpoint"] == "SearchRestApi"
+    assert item["source_ids"]["toc_id"] == "TOC-1"
+    assert item["source_ids"]["content_id"] == "CONTENT-1"
+    assert item["urls"]["viewer"].endswith("contentId=CONTENT-1&tocId=TOC-1")
+    assert item["pdf_text"]["status"] == "pending"
+    assert item["pdf_layout"]["status"] == "pending"
+    assert item["graph"]["status"] == "pending"
+    assert item["embedding"]["status"] == "pending"
 
 
 def test_fetch_items_mocked(crawler: SearchThemaCrawler, load_fixture) -> None:
@@ -275,7 +301,7 @@ def test_pety_html_fallback_disabled_by_default(tmp_data_dir: Path, mock_config:
         patch("crawler_search_thema.get_config", return_value=mock_config),
         patch("crawler_search_thema.setup_logger", return_value=Mock(name="logger")),
     ):
-        crawler = SearchThemaCrawler()
+        crawler = SearchThemaCrawler(preload_metadata=False)
 
     result = asyncio.run(crawler._fallback_items_from_error(ValueError("bad json"), None, 2024, None, 1))
     assert result is None

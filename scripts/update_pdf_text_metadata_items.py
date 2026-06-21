@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.pdf_text_metadata import analyze_pdf_text
+from src.metadata_schema import apply_item_schema, sync_pdf_text_metadata
+from src.pdf_text_metadata import analyze_pdf_text, compact_item_metadata
 
 
 SOURCE_NAMES = ("pety", "searchThema")
@@ -57,8 +58,7 @@ def source_from_item_path(path: Path) -> str:
 
 
 def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    excluded = {"sample_text"}
-    return {key: value for key, value in metadata.items() if key not in excluded}
+    return compact_item_metadata(metadata)
 
 
 def existing_metadata_current(item: dict[str, Any], pdf_path_text: str, max_pages: int | None) -> bool:
@@ -66,6 +66,10 @@ def existing_metadata_current(item: dict[str, Any], pdf_path_text: str, max_page
     if not isinstance(metadata, dict):
         return False
     if "text_extractable" not in metadata:
+        return False
+    if "pdf_text_class" not in metadata:
+        return False
+    if "needs_ocr" not in metadata:
         return False
     current_path = str(metadata.get("pdf_path_text") or metadata.get("pdf_path") or metadata.get("path") or "")
     if current_path != pdf_path_text:
@@ -109,6 +113,39 @@ def classify_item_for_update(
     if existing_metadata_current(item, pdf_path_text, max_pages):
         return "current"
     return "needs_update"
+
+
+def classify_existing_unextractable_candidate(
+    item_path: Path,
+    *,
+    max_pages: int | None,
+    force: bool,
+    include_non_completed: bool,
+) -> str:
+    try:
+        item = json.loads(item_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return "json_error"
+    if not isinstance(item, dict):
+        return "json_error"
+
+    pdf = item.get("pdf") if isinstance(item.get("pdf"), dict) else {}
+    pdf_status = str((pdf or {}).get("status") or "")
+    if not include_non_completed and pdf_status != "completed":
+        return "not_completed"
+
+    pdf_path_text = str((pdf or {}).get("path") or "").strip()
+    if not pdf_path_text:
+        return "missing_pdf_path"
+
+    metadata = item.get("pdf_text") if isinstance(item.get("pdf_text"), dict) else {}
+    if not metadata:
+        return "missing_pdf_text"
+    if metadata.get("text_extractable") is True:
+        return "existing_text_extractable"
+    if not force and existing_metadata_current(item, pdf_path_text, max_pages):
+        return "current_unextractable"
+    return "existing_unextractable"
 
 
 def analysis_scope(max_pages: int | None) -> str:
@@ -214,14 +251,7 @@ def analyze_pdf_text_layer_probe(
 
 
 def update_item_ocr(item: dict[str, Any], metadata: dict[str, Any]) -> None:
-    ocr = item.setdefault("ocr", {})
-    ocr["extracted_metadata"] = compact_metadata(metadata)
-    if metadata.get("text_extractable"):
-        ocr["status"] = "skipped_text_extractable"
-        ocr["skip_reason"] = "text_extractable_pdf"
-    else:
-        ocr.setdefault("status", "pending")
-        ocr["skip_reason"] = ""
+    sync_pdf_text_metadata(item, compact_metadata(metadata))
 
 
 def process_item(
@@ -270,6 +300,10 @@ def process_item(
             {
                 "status": "skipped_existing",
                 "text_extractable": bool(metadata.get("text_extractable")),
+                "pdf_text_class": metadata.get("pdf_text_class"),
+                "recovered_text": bool(metadata.get("recovered_text")),
+                "preferred_text_source": metadata.get("preferred_text_source"),
+                "needs_ocr": metadata.get("needs_ocr"),
             }
         )
         return result
@@ -282,6 +316,8 @@ def process_item(
             "status": "error",
             "error": integrity_error,
             "text_extractable": False,
+            "pdf_text_class": "error",
+            "needs_ocr": True,
             "path": str(pdf_path),
             "pdf_path": str(pdf_path),
             "pdf_path_text": pdf_path_text,
@@ -289,11 +325,18 @@ def process_item(
             "analysis_scope": analysis_scope(max_pages),
             "generated_at": iso_now(),
         }
-        item["pdf_text"] = compact_metadata(metadata)
+        apply_item_schema(item, source_detail=source)
         update_item_ocr(item, metadata)
         item["updated_at"] = iso_now()
         write_json(item_path, item)
-        result.update({"status": "updated_error", "error": integrity_error})
+        result.update(
+            {
+                "status": "updated_error",
+                "error": integrity_error,
+                "pdf_text_class": metadata.get("pdf_text_class"),
+                "needs_ocr": metadata.get("needs_ocr"),
+            }
+        )
         return result
 
     if method == "text-layer-probe":
@@ -322,7 +365,7 @@ def process_item(
         }
     )
 
-    item["pdf_text"] = compact_metadata(metadata)
+    apply_item_schema(item, source_detail=source)
     update_item_ocr(item, metadata)
     item["updated_at"] = iso_now()
     write_json(item_path, item)
@@ -337,6 +380,10 @@ def process_item(
             "scanned_pages": metadata.get("scanned_pages"),
             "total_chars": metadata.get("total_chars"),
             "error": metadata.get("error"),
+            "pdf_text_class": metadata.get("pdf_text_class"),
+            "recovered_text": bool(metadata.get("recovered_text")),
+            "preferred_text_source": metadata.get("preferred_text_source"),
+            "needs_ocr": metadata.get("needs_ocr"),
         }
     )
     return result
@@ -428,6 +475,11 @@ def main() -> int:
         action="store_true",
         help="Process only item JSON files whose pdf_text metadata is missing or stale.",
     )
+    parser.add_argument(
+        "--only-existing-unextractable",
+        action="store_true",
+        help="Process only completed items whose existing pdf_text metadata is not text-extractable.",
+    )
     parser.add_argument("--include-non-completed", action="store_true")
     parser.add_argument("--include-sample", action="store_true")
     parser.add_argument("--sample-chars", type=int, default=1000)
@@ -444,7 +496,20 @@ def main() -> int:
 
     item_paths = iter_item_paths(artifacts_root, sources)
     selection_counts: Counter[str] = Counter()
-    if args.only_missing:
+    if args.only_existing_unextractable:
+        selected_paths = []
+        for path in item_paths:
+            reason = classify_existing_unextractable_candidate(
+                path,
+                max_pages=args.max_pages,
+                force=args.force,
+                include_non_completed=args.include_non_completed,
+            )
+            selection_counts[reason] += 1
+            if reason == "existing_unextractable":
+                selected_paths.append(path)
+        item_paths = selected_paths
+    elif args.only_missing:
         selected_paths: list[Path] = []
         for path in item_paths:
             reason = classify_item_for_update(
@@ -492,6 +557,12 @@ def main() -> int:
         elif status in {"updated", "updated_error", "skipped_existing"}:
             counts["image_or_unextractable"] += 1
             by_source.setdefault(source, Counter())["image_or_unextractable"] += 1
+        pdf_text_class = str(result.get("pdf_text_class") or "unknown")
+        counts[f"class:{pdf_text_class}"] += 1
+        by_source.setdefault(source, Counter())[f"class:{pdf_text_class}"] += 1
+        if result.get("recovered_text"):
+            counts["recovered_text"] += 1
+            by_source.setdefault(source, Counter())["recovered_text"] += 1
         by_source.setdefault(source, Counter())[status] += 1
         if status in samples and len(samples[status]) < args.sample_limit:
             samples[status].append(result)
@@ -513,6 +584,7 @@ def main() -> int:
             "workers": args.workers,
             "force": args.force,
             "only_missing": args.only_missing,
+            "only_existing_unextractable": args.only_existing_unextractable,
             "include_non_completed": args.include_non_completed,
             "method": args.method,
         },

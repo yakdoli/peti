@@ -239,6 +239,7 @@ def test_playwright_fallback_triggered(crawler: SearchThemaCrawler, search_thema
     fallback.assert_awaited_once()
     assert item["pdf"]["status"] == "completed"
     assert item["status"] == "completed"
+    assert item["pdf_text"] == item["ocr"]["extracted_metadata"]
     assert crawler.stats["downloaded_pdfs"] == 1
 
 
@@ -265,6 +266,7 @@ def test_successful_download_clears_stale_failure_fields(
     assert item["pdf"]["status"] == "completed"
     assert "error" not in item["pdf"]
     assert "failed_at" not in item["pdf"]
+    assert item["pdf_text"] == item["ocr"]["extracted_metadata"]
 
 
 def test_http_only_failure_refreshes_browser_session(crawler: SearchThemaCrawler, search_thema_item: dict) -> None:

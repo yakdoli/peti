@@ -43,6 +43,13 @@ class HTTPClient(Protocol):
         """Perform a GET request."""
 
 
+class PlaceIndexLike(Protocol):
+    """Offline place index hook used before Juso API fallback."""
+
+    def match_address(self, address: str, **kwargs: Any) -> Any:
+        """Return a local match result for a full address string."""
+
+
 class JusoClientError(RuntimeError):
     """Base error for Juso client failures."""
 
@@ -397,6 +404,8 @@ class JusoClient:
     coord_url: str = JUSO_COORD_URL
     timeout: float = 10.0
     session: HTTPClient = field(default_factory=requests.Session)
+    place_index: Optional[PlaceIndexLike] = None
+    allow_api_fallback: bool = False
 
     def __post_init__(self) -> None:
         if self.api_key is None:
@@ -445,11 +454,22 @@ class JusoClient:
         include_coordinates: bool = False,
         count_per_page: int = 10,
         raise_on_error: bool = True,
+        as_of: Optional[str] = None,
     ) -> AddressConversionResult:
         """Convert an input address into both road-name and land-lot forms."""
 
         normalized = normalize_korean_address(address)
         input_type = detect_address_type(normalized)
+        local = self._convert_with_place_index(
+            source_address=address,
+            normalized=normalized,
+            input_type=input_type,
+            include_coordinates=include_coordinates,
+            as_of=as_of,
+        )
+        if local is not None and (local.selected is not None or not self.allow_api_fallback):
+            return local
+
         search = self.search(
             normalized,
             count_per_page=count_per_page,
@@ -478,6 +498,7 @@ class JusoClient:
         include_gps: bool = True,
         count_per_page: int = 10,
         raise_on_error: bool = True,
+        as_of: Optional[str] = None,
     ) -> AddressConversionResult:
         """Convert an old or current address to the current Juso address record.
 
@@ -490,6 +511,7 @@ class JusoClient:
             include_coordinates=include_gps,
             count_per_page=count_per_page,
             raise_on_error=raise_on_error,
+            as_of=as_of,
         )
 
     def fetch_coordinates(self, record: KoreanAddressRecord, *, raise_on_error: bool = True) -> Optional[AddressCoordinate]:
@@ -526,6 +548,53 @@ class JusoClient:
         if not isinstance(payload, Mapping):
             raise JusoClientError("Juso API 응답이 JSON 객체가 아닙니다.")
         return payload
+
+    def _convert_with_place_index(
+        self,
+        *,
+        source_address: str,
+        normalized: str,
+        input_type: str,
+        include_coordinates: bool,
+        as_of: Optional[str],
+    ) -> Optional[AddressConversionResult]:
+        if self.place_index is None:
+            return None
+
+        match = self.place_index.match_address(normalized, as_of=as_of)
+        match_data = _match_to_mapping(match)
+        selected_candidate = _match_selected(match, match_data)
+        candidate_values = _match_candidates(match, match_data)
+        ordered_candidates = _ordered_candidates(selected_candidate, candidate_values)
+        records = [_record_from_place_candidate(candidate, normalized) for candidate in ordered_candidates]
+        selected_record = records[0] if selected_candidate is not None and records else None
+        alternatives = records[1:] if selected_record is not None else records
+        coordinate = (
+            _coordinate_from_place_candidate(selected_candidate)
+            if include_coordinates and selected_candidate is not None
+            else None
+        )
+        search = AddressSearchResult(
+            query=source_address,
+            normalized_query=normalized,
+            input_type=input_type,
+            total_count=len(records),
+            current_page=1,
+            count_per_page=max(len(records), 1),
+            error_code="0",
+            error_message="offline_place_index",
+            records=records,
+            raw=match_data,
+        )
+        return AddressConversionResult(
+            source_address=source_address,
+            normalized_address=normalized,
+            input_type=input_type,
+            selected=selected_record,
+            alternatives=alternatives,
+            coordinate=coordinate,
+            search=search,
+        )
 
 
 def normalize_korean_address(value: str) -> str:
@@ -599,16 +668,20 @@ def convert_address(
     *,
     api_key: Optional[str] = None,
     client: Optional[JusoClient] = None,
+    place_index: Optional[PlaceIndexLike] = None,
+    allow_api_fallback: bool = False,
     include_coordinates: bool = False,
     count_per_page: int = 10,
+    as_of: Optional[str] = None,
 ) -> AddressConversionResult:
     """Convert one Korean address using a provided client or API key."""
 
-    active_client = client or JusoClient(api_key=api_key)
+    active_client = client or JusoClient(api_key=api_key, place_index=place_index, allow_api_fallback=allow_api_fallback)
     return active_client.convert(
         address,
         include_coordinates=include_coordinates,
         count_per_page=count_per_page,
+        as_of=as_of,
     )
 
 
@@ -617,16 +690,20 @@ def convert_historical_address(
     *,
     api_key: Optional[str] = None,
     client: Optional[JusoClient] = None,
+    place_index: Optional[PlaceIndexLike] = None,
+    allow_api_fallback: bool = False,
     include_gps: bool = True,
     count_per_page: int = 10,
+    as_of: Optional[str] = None,
 ) -> AddressConversionResult:
     """Convert an old address to the current address and optionally tag GPS."""
 
-    active_client = client or JusoClient(api_key=api_key)
+    active_client = client or JusoClient(api_key=api_key, place_index=place_index, allow_api_fallback=allow_api_fallback)
     return active_client.convert_historical_address(
         address,
         include_gps=include_gps,
         count_per_page=count_per_page,
+        as_of=as_of,
     )
 
 
@@ -635,17 +712,21 @@ def convert_addresses(
     *,
     api_key: Optional[str] = None,
     client: Optional[JusoClient] = None,
+    place_index: Optional[PlaceIndexLike] = None,
+    allow_api_fallback: bool = False,
     include_coordinates: bool = False,
     count_per_page: int = 10,
+    as_of: Optional[str] = None,
 ) -> List[AddressConversionResult]:
     """Convert multiple Korean addresses in order."""
 
-    active_client = client or JusoClient(api_key=api_key)
+    active_client = client or JusoClient(api_key=api_key, place_index=place_index, allow_api_fallback=allow_api_fallback)
     return [
         active_client.convert(
             address,
             include_coordinates=include_coordinates,
             count_per_page=count_per_page,
+            as_of=as_of,
         )
         for address in addresses
     ]
@@ -656,17 +737,21 @@ def tag_addresses_with_current_and_gps(
     *,
     api_key: Optional[str] = None,
     client: Optional[JusoClient] = None,
+    place_index: Optional[PlaceIndexLike] = None,
+    allow_api_fallback: bool = False,
     count_per_page: int = 10,
+    as_of: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return compact current-address and GPS tags for many addresses."""
 
-    active_client = client or JusoClient(api_key=api_key)
+    active_client = client or JusoClient(api_key=api_key, place_index=place_index, allow_api_fallback=allow_api_fallback)
     tagged: List[Dict[str, Any]] = []
     for address in addresses:
         result = active_client.convert_historical_address(
             address,
             include_gps=True,
             count_per_page=count_per_page,
+            as_of=as_of,
         )
         tagged.append(
             {
@@ -682,6 +767,152 @@ def tag_addresses_with_current_and_gps(
             }
         )
     return tagged
+
+
+def _match_to_mapping(match: Any) -> Dict[str, Any]:
+    if isinstance(match, Mapping):
+        return dict(match)
+    to_dict = getattr(match, "to_dict", None)
+    if callable(to_dict):
+        data = to_dict()
+        return dict(data) if isinstance(data, Mapping) else {"raw": data}
+    return {
+        "status": getattr(match, "status", ""),
+        "reason": getattr(match, "reason", ""),
+        "selected": _candidate_to_mapping(getattr(match, "selected", None)),
+        "candidates": [_candidate_to_mapping(candidate) for candidate in _as_list(getattr(match, "candidates", []))],
+    }
+
+
+def _match_selected(match: Any, match_data: Mapping[str, Any]) -> Any:
+    selected = match_data.get("selected")
+    if selected not in (None, ""):
+        return selected
+    return getattr(match, "selected", None)
+
+
+def _match_candidates(match: Any, match_data: Mapping[str, Any]) -> List[Any]:
+    candidates = match_data.get("candidates")
+    if candidates not in (None, ""):
+        return _as_list(candidates)
+    return _as_list(getattr(match, "candidates", []))
+
+
+def _ordered_candidates(selected: Any, candidates: Iterable[Any]) -> List[Any]:
+    ordered: List[Any] = []
+    if selected is not None:
+        ordered.append(selected)
+    selected_identity = _candidate_identity(selected)
+    for candidate in candidates:
+        if selected_identity and _candidate_identity(candidate) == selected_identity:
+            continue
+        ordered.append(candidate)
+    return ordered
+
+
+def _record_from_place_candidate(candidate: Any, normalized_query: str) -> KoreanAddressRecord:
+    data = _candidate_to_mapping(candidate)
+    parent_chain = _string_list(data.get("parent_chain"))
+    sido = parent_chain[0] if len(parent_chain) > 0 else ""
+    sigungu = parent_chain[1] if len(parent_chain) > 1 else _clean(data.get("parent_name"))
+    eupmyeondong = parent_chain[-1] if parent_chain else _clean(data.get("name"))
+    road_address = _clean(data.get("road_address"))
+    jibun_address = _clean(data.get("jibun_address"))
+    full_name = _clean(data.get("full_name")) or " ".join(part for part in (*parent_chain, _clean(data.get("name"))) if part)
+    display_address = road_address or jibun_address or full_name
+    return KoreanAddressRecord(
+        road_address=road_address,
+        road_address_without_detail=road_address or display_address,
+        jibun_address=jibun_address,
+        zip_no=_clean(data.get("zip_no")),
+        administrative_code=_clean(data.get("admin_code") or data.get("administrative_code")),
+        road_name_code=_clean(data.get("road_name_code")),
+        building_management_number=_clean(data.get("building_management_number")),
+        building_name=_clean(data.get("name")),
+        sido=sido,
+        sigungu=sigungu,
+        eupmyeondong=eupmyeondong,
+        source_query=normalized_query,
+        raw=data,
+    )
+
+
+def _coordinate_from_place_candidate(candidate: Any) -> Optional[AddressCoordinate]:
+    data = _candidate_to_mapping(candidate)
+    latitude = _to_float(data.get("representative_latitude"))
+    longitude = _to_float(data.get("representative_longitude"))
+    if latitude is None or longitude is None:
+        return None
+    source_crs = _clean(data.get("representative_point_crs")) or GPS_CRS
+    gps = GPSCoordinate(
+        latitude=latitude,
+        longitude=longitude,
+        source_crs=source_crs,
+        source_x=str(longitude),
+        source_y=str(latitude),
+    )
+    return AddressCoordinate(
+        entrance_x=str(longitude),
+        entrance_y=str(latitude),
+        source_crs=source_crs,
+        gps=gps,
+        administrative_code=_clean(data.get("admin_code") or data.get("administrative_code")),
+        road_name_code=_clean(data.get("road_name_code")),
+        building_management_number=_clean(data.get("building_management_number")),
+        building_name=_clean(data.get("name")),
+        raw=data,
+    )
+
+
+def _candidate_to_mapping(candidate: Any) -> Dict[str, Any]:
+    if candidate is None:
+        return {}
+    if isinstance(candidate, Mapping):
+        return dict(candidate)
+    to_dict = getattr(candidate, "to_dict", None)
+    if callable(to_dict):
+        data = to_dict()
+        if isinstance(data, Mapping):
+            return dict(data)
+    fields = (
+        "record_id",
+        "source_id",
+        "admin_code",
+        "name",
+        "area_kind",
+        "parent_chain",
+        "valid_from",
+        "valid_to",
+        "confidence",
+        "representative_latitude",
+        "representative_longitude",
+        "representative_point_crs",
+        "representative_point_source",
+        "road_address",
+        "jibun_address",
+        "zip_no",
+        "road_name_code",
+        "building_management_number",
+    )
+    return {field: getattr(candidate, field) for field in fields if hasattr(candidate, field)}
+
+
+def _candidate_identity(candidate: Any) -> str:
+    data = _candidate_to_mapping(candidate)
+    return "|".join(
+        _clean(data.get(field))
+        for field in ("record_id", "source_id", "admin_code", "valid_from", "road_address", "jibun_address")
+    )
+
+
+def _string_list(value: Any) -> List[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(">") if part.strip()]
+    if hasattr(value, "__iter__") and not isinstance(value, (bytes, Mapping)):
+        return [_clean(item) for item in value if _clean(item)]
+    return [_clean(value)]
 
 
 def gps_from_juso_coordinate(x: Any, y: Any, *, source_crs: str = JUSO_COORD_CRS) -> Optional[GPSCoordinate]:

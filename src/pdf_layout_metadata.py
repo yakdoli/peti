@@ -12,6 +12,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator
 
+try:
+    from src.metadata_schema import (
+        apply_item_schema,
+        compact_pdf_layout_metadata,
+        sync_pdf_layout_metadata,
+    )
+except ImportError:
+    from metadata_schema import (  # type: ignore[reportMissingImports]
+        apply_item_schema,
+        compact_pdf_layout_metadata,
+        sync_pdf_layout_metadata,
+    )
+
 from src.pdf_text_metadata import SOURCE_NAMES
 
 try:
@@ -439,6 +452,7 @@ def generate_source_layout_metadata(
         "skipped_missing_pdf_path": 0,
         "json_errors": 0,
         "errors": 0,
+        "updated_items": 0,
         "tables": 0,
         "table_strategy": table_strategy,
     }
@@ -501,6 +515,8 @@ def generate_source_layout_metadata(
         metadata = result["metadata"]
         write_json(sidecar_path, metadata)
         index[rel_key] = compact_index_metadata(metadata, sidecar_path, artifacts_root)
+        if update_item_layout_metadata(Path(str(result["item_path"])), metadata):
+            summary["updated_items"] += 1
         summary["processed"] += 1
         summary["tables"] += len(metadata.get("tables") or [])
         if metadata.get("status") == "error":
@@ -520,6 +536,22 @@ def generate_source_layout_metadata(
     write_json(output_dir / "metadata.json", index)
     write_json(output_dir / "summary.json", summary)
     return summary
+
+
+def update_item_layout_metadata(item_path: Path, pdf_layout_metadata: Dict[str, Any]) -> bool:
+    """Update an existing item JSON with compact pdf_layout metadata."""
+    if not item_path.exists():
+        return False
+
+    item = read_json(item_path)
+    if not isinstance(item, dict):
+        return False
+
+    apply_item_schema(item, source_detail=str(pdf_layout_metadata.get("source") or ""))
+    sync_pdf_layout_metadata(item, compact_pdf_layout_metadata(pdf_layout_metadata))
+    item["updated_at"] = iso_now()
+    write_json(item_path, item)
+    return True
 
 
 def analyze_layout_work_item(work_item: Dict[str, Any]) -> Dict[str, Any]:
@@ -543,6 +575,7 @@ def analyze_layout_work_item(work_item: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "rel_key": work_item["rel_key"],
         "sidecar_path": work_item["sidecar_path"],
+        "item_path": work_item["item_path"],
         "metadata": metadata,
     }
 
