@@ -27,6 +27,7 @@ from src.metadata_schema import apply_item_schema
 
 SOURCE_NAMES = ("pety", "searchThema")
 DEFAULT_MODEL_ID = "olberdingbrands/Qwen3.6-35B-A3B-AWQ"
+DEFAULT_OPENCODE_MODEL_ID = "opencode/deepseek-v4-flash-free"
 A4_250DPI_WIDTH = 2480
 A4_250DPI_HEIGHT = 3508
 
@@ -91,10 +92,20 @@ def recovery_scope(args: argparse.Namespace) -> str:
     return f"first_{args.max_pages}_pages_{args.dpi}dpi_single_page_maxside{args.max_side}"
 
 
+def effective_model_id(args: argparse.Namespace) -> str:
+    if args.ocr_backend == "opencode_cli":
+        return str(args.opencode_model)
+    return str(args.model_id)
+
+
 def existing_recovery_current(item: dict[str, Any], args: argparse.Namespace) -> bool:
     ocr = item.get("ocr") if isinstance(item.get("ocr"), dict) else {}
     recovery = ocr.get("vlm_recovery") if isinstance(ocr.get("vlm_recovery"), dict) else {}
     if recovery.get("status") not in {"recovered", "partial", "unrecovered"}:
+        return False
+    if recovery.get("engine") != args.ocr_backend:
+        return False
+    if recovery.get("model_id") != effective_model_id(args):
         return False
     if recovery.get("analysis_scope") != recovery_scope(args):
         return False
@@ -218,6 +229,38 @@ def jsonable(value: Any) -> Any:
     return value
 
 
+def ocr_prompt(context: str = "") -> str:
+    prompt = (
+        "You are doing OCR for a Korean government gazette scanned page. "
+        "Transcribe only visible text in natural reading order. Preserve Korean Hangul/Hanja, "
+        "digits, punctuation, dates, list markers, table cell text, and line breaks when clear. "
+        "Do not infer text that is not visible. Return exactly one JSON object with this schema: "
+        "{\"text\":\"...\",\"confidence\":0.0,\"notes\":\"...\"}. Do not add commentary."
+    )
+    if context:
+        prompt = f"{prompt}\n\nImage context: {context}"
+    return prompt
+
+
+def ocr_result_from_response(raw: str, *, engine: str, model_id: str) -> dict[str, Any]:
+    parsed = extract_json_object(raw) if raw else {}
+    text = normalize_text(str(parsed.get("text", "")).strip())
+    confidence = parsed.get("confidence", 0.0)
+    try:
+        confidence_value = float(confidence)
+    except (TypeError, ValueError):
+        confidence_value = 0.0
+    return {
+        "engine": engine,
+        "model_id": model_id,
+        "text": text,
+        "confidence": max(0.0, min(1.0, confidence_value)),
+        "notes": str(parsed.get("notes", "")).strip(),
+        "raw_response": raw[-4000:] if raw else "",
+        "status": "ok" if text else "empty",
+    }
+
+
 def qwen_ocr_page(
     image_path: Path,
     *,
@@ -229,15 +272,7 @@ def qwen_ocr_page(
     max_side: int,
     context: str = "",
 ) -> dict[str, Any]:
-    prompt = (
-        "You are doing OCR for a Korean government gazette scanned page. "
-        "Transcribe only visible text in natural reading order. Preserve Korean Hangul/Hanja, "
-        "digits, punctuation, dates, list markers, table cell text, and line breaks when clear. "
-        "Do not infer text that is not visible. Return exactly one JSON object with this schema: "
-        "{\"text\":\"...\",\"confidence\":0.0,\"notes\":\"...\"}. Do not add commentary."
-    )
-    if context:
-        prompt = f"{prompt}\n\nImage context: {context}"
+    prompt = ocr_prompt(context)
     payload = {
         "model": model_id,
         "messages": [
@@ -256,25 +291,80 @@ def qwen_ocr_page(
         "chat_template_kwargs": {"enable_thinking": False},
     }
     raw = message_content(openai_chat_completion(endpoint_url, payload, timeout))
-    parsed = extract_json_object(raw) if raw else {}
-    text = normalize_text(str(parsed.get("text", "")).strip())
-    confidence = parsed.get("confidence", 0.0)
+    return ocr_result_from_response(raw, engine="qwen_vllm", model_id=model_id)
+
+
+def opencode_ocr_page(
+    image_path: Path,
+    *,
+    model_id: str,
+    timeout: float,
+    context: str = "",
+) -> dict[str, Any]:
+    prompt = "\n".join([ocr_prompt(context), "", f"Image path: {image_path.resolve()}"])
+    command = [
+        "opencode",
+        "run",
+        "-m",
+        model_id,
+        "--file",
+        str(image_path),
+        "--",
+        prompt,
+    ]
     try:
-        confidence_value = float(confidence)
-    except (TypeError, ValueError):
-        confidence_value = 0.0
-    return {
-        "engine": "qwen_vllm",
-        "model_id": model_id,
-        "text": text,
-        "confidence": max(0.0, min(1.0, confidence_value)),
-        "notes": str(parsed.get("notes", "")).strip(),
-        "raw_response": raw[-4000:] if raw else "",
-        "status": "ok" if text else "empty",
-    }
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "engine": "opencode_cli",
+            "model_id": model_id,
+            "text": "",
+            "confidence": 0.0,
+            "notes": "",
+            "raw_response": "",
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    result = ocr_result_from_response(completed.stdout, engine="opencode_cli", model_id=model_id)
+    if completed.returncode != 0:
+        result.update(
+            {
+                "status": "error",
+                "returncode": completed.returncode,
+                "stdout": completed.stdout[-2000:],
+                "stderr": completed.stderr[-2000:],
+            }
+        )
+    return result
 
 
-def peer_prompt(qwen_text: str, image_path: Path, context: str = "") -> str:
+def run_primary_ocr_page(
+    image_path: Path,
+    *,
+    args: argparse.Namespace,
+    page_number: int,
+    context: str = "",
+) -> dict[str, Any]:
+    if args.ocr_backend == "opencode_cli":
+        return opencode_ocr_page(
+            image_path,
+            model_id=args.opencode_model,
+            timeout=args.opencode_timeout,
+            context=context,
+        )
+    return qwen_ocr_page(
+        image_path,
+        endpoint_url=args.endpoint_url,
+        model_id=args.model_id,
+        timeout=args.qwen_timeout,
+        max_tokens=args.max_tokens,
+        seed=args.seed + page_number,
+        max_side=args.max_side,
+        context=context,
+    )
+
+
+def peer_prompt(ocr_text: str, image_path: Path, context: str = "") -> str:
     return "\n".join(
         [
             "You are peer-verifying Korean OCR from a scanned government gazette page.",
@@ -286,26 +376,25 @@ def peer_prompt(qwen_text: str, image_path: Path, context: str = "") -> str:
             f"Image path: {image_path.resolve()}",
             f"![page]({image_path.resolve()})",
             "",
-            "Qwen OCR text:",
-            qwen_text[:12000],
+            "Primary OCR text:",
+            ocr_text[:12000],
         ]
     )
 
 
-def run_peer_cli(peer: str, image_path: Path, qwen_text: str, timeout: float, context: str = "") -> dict[str, Any]:
-    prompt = peer_prompt(qwen_text, image_path, context=context)
+def run_peer_cli(peer: str, image_path: Path, ocr_text: str, timeout: float, context: str = "") -> dict[str, Any]:
+    prompt = peer_prompt(ocr_text, image_path, context=context)
     if peer == "agy":
         command = ["agy", "-p", prompt, "--print-timeout", f"{max(1, int(round(timeout)))}s"]
     elif peer == "codex":
         command = [
             "codex",
             "exec",
-            "--ask-for-approval",
-            "never",
             "--sandbox",
             "read-only",
             "-i",
             str(image_path),
+            "--",
             prompt,
         ]
     elif peer == "claude":
@@ -350,7 +439,9 @@ def choose_final_text(qwen_result: dict[str, Any], peer_results: dict[str, dict[
     ]
     if revisions:
         return str(revisions[0]), "peer_revision"
-    return str(qwen_result.get("text", "")), "qwen_primary"
+    engine = str(qwen_result.get("engine") or "primary")
+    source = "qwen_primary" if engine == "qwen_vllm" else f"{engine}_primary"
+    return str(qwen_result.get("text", "")), source
 
 
 def page_image_context(page_number: int, page_image: dict[str, Any], page_width: int, page_height: int, dpi: int) -> str:
@@ -396,39 +487,35 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
                 for page_image in ocr_images:
                     page_image_path = Path(page_image["image_path"])
                     context = page_image_context(page_number, page_image, page_width, page_height, args.dpi)
-                    qwen_result = qwen_ocr_page(
+                    primary_ocr = run_primary_ocr_page(
                         page_image_path,
-                        endpoint_url=args.endpoint_url,
-                        model_id=args.model_id,
-                        timeout=args.qwen_timeout,
-                        max_tokens=args.max_tokens,
-                        seed=args.seed + page_number,
-                        max_side=args.max_side,
+                        args=args,
+                        page_number=page_number,
                         context=context,
                     )
                     peer_results = {
                         peer: run_peer_cli(
                             peer,
                             page_image_path,
-                            qwen_result.get("text", ""),
+                            primary_ocr.get("text", ""),
                             timeout=args.peer_timeout,
                             context=context,
                         )
                         for peer in peers
-                        if qwen_result.get("text")
+                        if primary_ocr.get("text")
                     }
-                    final_text, final_source = choose_final_text(qwen_result, peer_results)
-                    image_records.append(
-                        {
-                            "page_image": page_image["page_image"],
-                            "bbox": page_image["bbox"],
-                            "status": "recovered" if final_text else "empty",
-                            "qwen": qwen_result,
-                            "peers": peer_results,
-                            "final_text": final_text,
-                            "final_source": final_source,
-                        }
-                    )
+                    final_text, final_source = choose_final_text(primary_ocr, peer_results)
+                    image_record = {
+                        "page_image": page_image["page_image"],
+                        "bbox": page_image["bbox"],
+                        "status": "recovered" if final_text else "empty",
+                        "primary_ocr": primary_ocr,
+                        "peers": peer_results,
+                        "final_text": final_text,
+                        "final_source": final_source,
+                    }
+                    image_record["opencode" if args.ocr_backend == "opencode_cli" else "qwen"] = primary_ocr
+                    image_records.append(image_record)
                 final_text = normalize_text(
                     "\n".join(record.get("final_text", "") for record in image_records if record.get("final_text"))
                 )
@@ -462,9 +549,9 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
     recovery = {
         "status": "recovered" if recovered_text else "unrecovered",
         "created_at": iso_now(),
-        "engine": "qwen_vllm",
-        "model_id": args.model_id,
-        "endpoint_url": args.endpoint_url,
+        "engine": args.ocr_backend,
+        "model_id": effective_model_id(args),
+        "endpoint_url": args.endpoint_url if args.ocr_backend == "qwen_vllm" else "",
         "analysis_scope": recovery_scope(args),
         "pages_total": pages_total,
         "pages_processed": len(recovery_pages),
@@ -501,17 +588,20 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Recover OCR-needed PDFs with Qwen VLM OCR and CLI peer review.")
+    parser = argparse.ArgumentParser(description="Recover OCR-needed PDFs with VLM OCR and CLI peer review.")
     parser.add_argument("--source", default="all", help="all, pety, searchThema, or comma-separated sources")
     parser.add_argument("--artifacts-root", type=Path, default=Path("artifacts"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/validation"))
-    parser.add_argument("--endpoint-url", default="http://127.0.0.1:30000")
-    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--ocr-backend", choices=("opencode_cli", "qwen_vllm"), default="opencode_cli")
+    parser.add_argument("--endpoint-url", default="http://127.0.0.1:30000", help="qwen_vllm OpenAI-compatible endpoint")
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="qwen_vllm model id")
+    parser.add_argument("--opencode-model", default=DEFAULT_OPENCODE_MODEL_ID, help="opencode CLI model id")
     parser.add_argument("--max-pages", type=int, default=3)
     parser.add_argument("--dpi", type=int, default=250)
     parser.add_argument("--max-side", type=int, default=A4_250DPI_HEIGHT)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--qwen-timeout", type=float, default=420.0)
+    parser.add_argument("--opencode-timeout", type=float, default=180.0)
     parser.add_argument("--peer-timeout", type=float, default=300.0)
     parser.add_argument("--peers", default="agy,codex", help="comma-separated: agy,codex,claude; empty disables peers")
     parser.add_argument("--seed", type=int, default=17)
@@ -522,6 +612,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.max_side <= 0:
         parser.error("--max-side must be positive")
+    if args.ocr_backend == "opencode_cli" and not args.opencode_model.strip():
+        parser.error("--opencode-model must be non-empty for opencode_cli")
     if args.dpi < 250:
         print(
             f"warning: dpi={args.dpi} is below A4 250dpi recovery target; use --dpi 250 for target coverage",
@@ -538,7 +630,8 @@ def main() -> int:
         paths = paths[: args.limit]
     print(
         f"vlm ocr recovery started: {iso_now()} items={len(paths)} max_pages={args.max_pages} "
-        f"dpi={args.dpi} page_ocr_mode=single_page max_side={args.max_side} peers={args.peers}",
+        f"dpi={args.dpi} page_ocr_mode=single_page max_side={args.max_side} "
+        f"backend={args.ocr_backend} model={effective_model_id(args)} peers={args.peers}",
         flush=True,
     )
 
