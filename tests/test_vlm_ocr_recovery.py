@@ -45,7 +45,7 @@ def test_opencode_ocr_page_uses_file_attachment(monkeypatch, tmp_path):
 
     result = opencode_ocr_page(
         page,
-        model_id="opencode/deepseek-v4-flash-free",
+        model_id="opencode/nemotron-3-ultra-free",
         timeout=12,
         context="page=1",
     )
@@ -57,7 +57,7 @@ def test_opencode_ocr_page_uses_file_attachment(monkeypatch, tmp_path):
         "opencode",
         "run",
         "-m",
-        "opencode/deepseek-v4-flash-free",
+        "opencode/nemotron-3-ultra-free",
         "--file",
     ]
     assert seen["command"][5] == str(page)

@@ -27,7 +27,7 @@ from src.metadata_schema import apply_item_schema
 
 SOURCE_NAMES = ("pety", "searchThema")
 DEFAULT_MODEL_ID = "olberdingbrands/Qwen3.6-35B-A3B-AWQ"
-DEFAULT_OPENCODE_MODEL_ID = "opencode/deepseek-v4-flash-free"
+DEFAULT_OPENCODE_MODEL_ID = "opencode/nemotron-3-ultra-free"
 A4_250DPI_WIDTH = 2480
 A4_250DPI_HEIGHT = 3508
 
