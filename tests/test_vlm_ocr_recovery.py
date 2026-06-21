@@ -1,4 +1,5 @@
 from argparse import Namespace
+from pathlib import Path
 
 from PIL import Image
 
@@ -47,6 +48,7 @@ def test_opencode_ocr_page_uses_file_attachment(monkeypatch, tmp_path):
         page,
         model_id="opencode/nemotron-3-ultra-free",
         timeout=12,
+        max_side=100,
         context="page=1",
     )
 
@@ -64,3 +66,36 @@ def test_opencode_ocr_page_uses_file_attachment(monkeypatch, tmp_path):
     assert seen["command"][6] == "--"
     assert "Image context: page=1" in seen["command"][7]
     assert seen["timeout"] == 12
+
+
+def test_opencode_ocr_page_downscales_file_attachment(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (200, 100), "white").save(page)
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"text":"관보","confidence":0.87,"notes":"ok"}'
+        stderr = ""
+
+    def fake_run(command, capture_output, text, timeout, check):
+        attachment = command[5]
+        with Image.open(attachment) as image:
+            seen["size"] = image.size
+        seen["attachment"] = attachment
+        return Completed()
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.subprocess.run", fake_run)
+
+    result = opencode_ocr_page(
+        page,
+        model_id="opencode/nemotron-3-ultra-free",
+        timeout=12,
+        max_side=50,
+        context="page=1",
+    )
+
+    assert result["status"] == "ok"
+    assert seen["attachment"] != str(page)
+    assert seen["size"] == (50, 25)
+    assert not Path(seen["attachment"]).exists()

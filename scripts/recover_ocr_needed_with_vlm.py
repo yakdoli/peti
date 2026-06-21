@@ -151,6 +151,22 @@ def image_data_url(path: Path, max_side: int) -> str:
     return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 
 
+def cli_attachment_image(path: Path, max_side: int) -> tuple[Path, Path | None]:
+    from PIL import Image
+
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        if max(image.size) <= max_side:
+            return path, None
+        ratio = max_side / float(max(image.size))
+        size = (max(1, int(round(image.width * ratio))), max(1, int(round(image.height * ratio))))
+        image = image.resize(size, Image.Resampling.LANCZOS)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            temp_path = Path(tmp.name)
+        image.save(temp_path, format="PNG")
+    return temp_path, temp_path
+
+
 def image_size(path: Path) -> tuple[int, int]:
     from PIL import Image
 
@@ -299,16 +315,18 @@ def opencode_ocr_page(
     *,
     model_id: str,
     timeout: float,
+    max_side: int,
     context: str = "",
 ) -> dict[str, Any]:
-    prompt = "\n".join([ocr_prompt(context), "", f"Image path: {image_path.resolve()}"])
+    attachment_path, cleanup_path = cli_attachment_image(image_path, max_side=max_side)
+    prompt = "\n".join([ocr_prompt(context), "", f"Image path: {attachment_path.resolve()}"])
     command = [
         "opencode",
         "run",
         "-m",
         model_id,
         "--file",
-        str(image_path),
+        str(attachment_path),
         "--",
         prompt,
     ]
@@ -325,6 +343,9 @@ def opencode_ocr_page(
             "status": "error",
             "error": f"{type(exc).__name__}: {exc}",
         }
+    finally:
+        if cleanup_path is not None:
+            cleanup_path.unlink(missing_ok=True)
     result = ocr_result_from_response(completed.stdout, engine="opencode_cli", model_id=model_id)
     if completed.returncode != 0:
         result.update(
@@ -350,6 +371,7 @@ def run_primary_ocr_page(
             image_path,
             model_id=args.opencode_model,
             timeout=args.opencode_timeout,
+            max_side=args.max_side,
             context=context,
         )
     return qwen_ocr_page(
