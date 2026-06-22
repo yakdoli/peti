@@ -705,6 +705,37 @@ def test_run_peer_reviews_qwen_reject_suppresses_cli_fallback(monkeypatch, tmp_p
     assert peer_results_conclusive(result) is True
 
 
+def test_run_peer_reviews_empty_primary_uses_cli_after_qwen_reject(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    calls = {"qwen": 0, "cli": 0}
+
+    def fake_qwen(*args, **kwargs):
+        calls["qwen"] += 1
+        return {"status": "ok", "verdict": "reject", "corrected_text": "", "issues": ["empty"], "confidence": 0.95}
+
+    def fake_cli(*args, **kwargs):
+        calls["cli"] += 1
+        return {"status": "ok", "verdict": "revise", "corrected_text": "복구 전사", "issues": [], "confidence": 0.9}
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.qwen_peer_review_page", fake_qwen)
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.run_peer_cli", fake_cli)
+
+    result = run_peer_reviews(
+        qwen_image_path=page,
+        cli_image_path=page,
+        primary_ocr={"status": "empty", "text": "", "confidence": 0.0, "finish_reason": "stop"},
+        args=peer_review_args(),
+        context="page=1",
+        page_number=1,
+    )
+
+    assert calls == {"qwen": 1, "cli": 1}
+    assert result["qwen_api:qwen3.5-27b"]["verdict"] == "reject"
+    assert result["codex"]["verdict"] == "revise"
+    assert "empty_text" in result["codex"]["fallback_reasons"]
+
+
 def test_choose_final_text_uses_high_confidence_peer_revision():
     primary = {"engine": "opencode_cli", "text": "원문"}
     low_confidence = {

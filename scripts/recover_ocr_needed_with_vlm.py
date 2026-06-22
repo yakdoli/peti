@@ -1059,6 +1059,16 @@ def peer_results_conclusive(peer_results: dict[str, dict[str, Any]]) -> bool:
     return any(peer_result_conclusive(result) for result in peer_results.values())
 
 
+def peer_results_have_revision(peer_results: dict[str, dict[str, Any]]) -> bool:
+    return any(
+        result.get("status") == "ok"
+        and result.get("verdict") == "revise"
+        and result.get("corrected_text")
+        and peer_confidence(result) >= 0.8
+        for result in peer_results.values()
+    )
+
+
 def run_peer_reviews(
     *,
     qwen_image_path: Path,
@@ -1069,9 +1079,6 @@ def run_peer_reviews(
     page_number: int,
 ) -> dict[str, dict[str, Any]]:
     ocr_text = str(primary_ocr.get("text") or "")
-    if not ocr_text:
-        return {}
-
     cli_peers = csv_parts(getattr(args, "peers", ""))
     qwen_api_profile = qwen_peer_api_profile(args)
     qwen_models = parse_qwen_peer_models(getattr(args, "qwen_peer_models", ""), api_profile=qwen_api_profile)
@@ -1117,14 +1124,16 @@ def run_peer_reviews(
     cli_fallback = str(getattr(args, "cli_peer_fallback", "auto"))
     run_cli = False
     if cli_peers and cli_fallback != "off":
+        qwen_results = {key: value for key, value in peer_results.items() if key.startswith(QWEN_API_PEER_PREFIX)}
         if cli_fallback == "always":
             run_cli = True
         elif not qwen_models:
             run_cli = True
         elif qwen_attempted:
-            run_cli = not peer_results_conclusive(
-                {key: value for key, value in peer_results.items() if key.startswith(QWEN_API_PEER_PREFIX)}
-            )
+            if "empty_text" in reasons:
+                run_cli = not peer_results_have_revision(qwen_results)
+            else:
+                run_cli = not peer_results_conclusive(qwen_results)
         else:
             run_cli = bool(reasons)
 
