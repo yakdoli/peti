@@ -49,11 +49,16 @@ IMAGE_PREPROCESSORS = (
     QWEN_VL_250DPI_BINARIZE_PREPROCESSOR,
 )
 QWEN_API_PROFILES = ("local", "dashscope")
+QWEN_PEER_MODES = ("off", "uncertain", "always")
+CLI_PEER_FALLBACK_MODES = ("auto", "always", "off")
+QWEN_API_PEER_PREFIX = "qwen_api:"
 DEFAULT_QWEN_TEMPERATURE = 0.2
 DEFAULT_QWEN_TOP_P = 0.8
 DEFAULT_QWEN_TOP_K = 20
 DEFAULT_QWEN_MIN_P = 0.0
 DEFAULT_QWEN_PRESENCE_PENALTY = 1.5
+DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD = 0.9
+DEFAULT_QWEN_PEER_MIN_CHARS = 300
 
 
 def iso_now() -> str:
@@ -75,6 +80,33 @@ def parse_sources(value: str) -> set[str]:
     if value == "all":
         return set(SOURCE_NAMES)
     return {part.strip() for part in value.split(",") if part.strip()}
+
+
+def csv_parts(value: str) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def normalize_qwen_api_model_id(model_id: str, *, api_profile: str = "local") -> str:
+    candidate = str(model_id or "").strip()
+    if api_profile == "dashscope" and "/" not in candidate and candidate.lower().startswith("qwen"):
+        return candidate.lower()
+    return candidate
+
+
+def qwen_peer_api_profile(args: argparse.Namespace) -> str:
+    return str(getattr(args, "qwen_peer_api_profile", "") or getattr(args, "qwen_api_profile", "local"))
+
+
+def parse_qwen_peer_models(value: str, *, api_profile: str = "local") -> list[str]:
+    return [normalize_qwen_api_model_id(model, api_profile=api_profile) for model in csv_parts(value)]
+
+
+def qwen_peer_key(model_id: str) -> str:
+    return f"{QWEN_API_PEER_PREFIX}{model_id}"
+
+
+def qwen_peer_model_from_key(peer: str) -> str:
+    return peer[len(QWEN_API_PEER_PREFIX) :].strip()
 
 
 def iter_ocr_needed_items(artifacts_root: Path, sources: set[str]) -> list[Path]:
@@ -478,6 +510,7 @@ def qwen_ocr_page(
     context: str = "",
 ) -> dict[str, Any]:
     prompt = ocr_prompt(context)
+    request_model_id = normalize_qwen_api_model_id(model_id, api_profile=api_profile)
     image_url, image_metadata = prepared_image_data_url(
         image_path,
         max_side=max_side,
@@ -485,7 +518,7 @@ def qwen_ocr_page(
         upscale=image_upscale,
     )
     payload = {
-        "model": model_id,
+        "model": request_model_id,
         "messages": [
             {
                 "role": "user",
@@ -513,7 +546,7 @@ def qwen_ocr_page(
     response = openai_chat_completion(endpoint_url, payload, timeout, api_key_env=api_key_env)
     duration_s = time.perf_counter() - started_at
     raw = message_content(response)
-    result = ocr_result_from_response(raw, engine="qwen_vllm", model_id=model_id)
+    result = ocr_result_from_response(raw, engine="qwen_vllm", model_id=request_model_id)
     choice = {}
     try:
         choice = response["choices"][0] if response else {}
@@ -849,11 +882,263 @@ def run_peer_cli(
     }
 
 
+def qwen_peer_prompt(ocr_text: str, context: str = "") -> str:
+    prompt = (
+        "You are peer-verifying Korean OCR from a scanned government gazette page. "
+        "Compare the OCR text against the attached image. Do not transcribe the whole image unless needed. "
+        "Return exactly one JSON object: "
+        "{\"verdict\":\"accept|revise|reject\",\"corrected_text\":\"...\",\"issues\":[\"...\"],\"confidence\":0.0}. "
+        "Use accept when the OCR is good enough. Use revise only when you can correct visible errors. "
+        "Use reject when the OCR is too incomplete or the image cannot be compared reliably. "
+        "Do not invent text that is not visible. Do not add commentary, markdown fences, or apologies."
+    )
+    if context:
+        prompt = f"{prompt}\n\nImage context: {context}"
+    return "\n".join([prompt, "", "Primary OCR text:", ocr_text[:12000]])
+
+
+def peer_result_from_response(raw: str, *, engine: str, model_id: str) -> dict[str, Any]:
+    parsed = extract_json_object(raw) if raw else {}
+    verdict = str(parsed.get("verdict", "")).strip().lower() if parsed else ""
+    if verdict not in {"accept", "revise", "reject"}:
+        verdict = ""
+    confidence = parsed.get("confidence", 0.0) if parsed else 0.0
+    try:
+        confidence_value = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence_value = 0.0
+    issues = parsed.get("issues", []) if parsed else []
+    if not isinstance(issues, list):
+        issues = [str(issues)]
+    corrected_text = normalize_text(str(parsed.get("corrected_text", "")).strip()) if parsed else ""
+    return {
+        "engine": engine,
+        "model_id": model_id,
+        "status": "ok" if parsed and verdict else "unparsed",
+        "verdict": verdict,
+        "corrected_text": corrected_text,
+        "issues": [str(issue) for issue in issues],
+        "confidence": confidence_value,
+        "raw_response": raw[-4000:] if raw else "",
+    }
+
+
+def qwen_peer_review_page(
+    image_path: Path,
+    ocr_text: str,
+    *,
+    endpoint_url: str,
+    model_id: str,
+    timeout: float,
+    max_tokens: int,
+    seed: int,
+    max_side: int,
+    image_preprocess: str = QWEN_VL_250DPI_PREPROCESSOR,
+    image_upscale: float = 1.0,
+    temperature: float = DEFAULT_QWEN_TEMPERATURE,
+    top_p: float = DEFAULT_QWEN_TOP_P,
+    top_k: int = DEFAULT_QWEN_TOP_K,
+    min_p: float = DEFAULT_QWEN_MIN_P,
+    presence_penalty: float = DEFAULT_QWEN_PRESENCE_PENALTY,
+    enable_thinking: bool = True,
+    thinking_budget: int = 128,
+    api_profile: str = "local",
+    api_key_env: str = "",
+    context: str = "",
+) -> dict[str, Any]:
+    request_model_id = normalize_qwen_api_model_id(model_id, api_profile=api_profile)
+    image_url, image_metadata = prepared_image_data_url(
+        image_path,
+        max_side=max_side,
+        preprocess=image_preprocess,
+        upscale=image_upscale,
+    )
+    payload = {
+        "model": request_model_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": qwen_peer_prompt(ocr_text, context=context)},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "seed": seed,
+    }
+    if api_profile == "dashscope":
+        payload["enable_thinking"] = enable_thinking
+        if thinking_budget > 0:
+            payload["thinking_budget"] = thinking_budget
+    else:
+        payload["top_k"] = top_k
+        payload["min_p"] = min_p
+        payload["presence_penalty"] = presence_penalty
+        payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+    started_at = time.perf_counter()
+    response = openai_chat_completion(endpoint_url, payload, timeout, api_key_env=api_key_env)
+    duration_s = time.perf_counter() - started_at
+    raw = message_content(response)
+    result = peer_result_from_response(raw, engine="qwen_api_peer", model_id=request_model_id)
+    choice = {}
+    try:
+        choice = response["choices"][0] if response else {}
+    except (KeyError, IndexError, TypeError):
+        choice = {}
+    result["input_image"] = image_metadata
+    result["generation"] = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "presence_penalty": presence_penalty,
+        "max_tokens": max_tokens,
+        "seed": seed,
+        "enable_thinking": enable_thinking,
+        "thinking_budget": thinking_budget,
+        "api_profile": api_profile,
+    }
+    result["duration_s"] = duration_s
+    result["usage"] = response.get("usage", {}) if isinstance(response, dict) else {}
+    result["finish_reason"] = choice.get("finish_reason", "") if isinstance(choice, dict) else ""
+    return result
+
+
 def peer_confidence(result: dict[str, Any]) -> float:
     try:
         return max(0.0, min(1.0, float(result.get("confidence", 0.0))))
     except (TypeError, ValueError):
         return 0.0
+
+
+def primary_review_reasons(
+    primary_ocr: dict[str, Any],
+    *,
+    confidence_threshold: float = DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD,
+    min_chars: int = DEFAULT_QWEN_PEER_MIN_CHARS,
+) -> list[str]:
+    reasons: list[str] = []
+    text = str(primary_ocr.get("text") or "")
+    status = str(primary_ocr.get("status") or "")
+    if status != "ok":
+        reasons.append(f"primary_status:{status or 'missing'}")
+    if not text.strip():
+        reasons.append("empty_text")
+    elif len(text.strip()) < min_chars:
+        reasons.append(f"short_text:{len(text.strip())}")
+    if peer_confidence(primary_ocr) < confidence_threshold:
+        reasons.append(f"low_confidence:{peer_confidence(primary_ocr):.3f}")
+    finish_reason = str(primary_ocr.get("finish_reason") or "")
+    if finish_reason and finish_reason != "stop":
+        reasons.append(f"finish_reason:{finish_reason}")
+    return reasons
+
+
+def peer_result_conclusive(result: dict[str, Any]) -> bool:
+    if result.get("status") != "ok":
+        return False
+    confidence = peer_confidence(result)
+    verdict = result.get("verdict")
+    if verdict == "accept" and confidence >= 0.75:
+        return True
+    if verdict == "revise" and result.get("corrected_text") and confidence >= 0.8:
+        return True
+    return False
+
+
+def peer_results_conclusive(peer_results: dict[str, dict[str, Any]]) -> bool:
+    return any(peer_result_conclusive(result) for result in peer_results.values())
+
+
+def run_peer_reviews(
+    *,
+    qwen_image_path: Path,
+    cli_image_path: Path,
+    primary_ocr: dict[str, Any],
+    args: argparse.Namespace,
+    context: str,
+    page_number: int,
+) -> dict[str, dict[str, Any]]:
+    ocr_text = str(primary_ocr.get("text") or "")
+    if not ocr_text:
+        return {}
+
+    cli_peers = csv_parts(getattr(args, "peers", ""))
+    qwen_api_profile = qwen_peer_api_profile(args)
+    qwen_models = parse_qwen_peer_models(getattr(args, "qwen_peer_models", ""), api_profile=qwen_api_profile)
+    reasons = primary_review_reasons(
+        primary_ocr,
+        confidence_threshold=float(
+            getattr(args, "qwen_peer_confidence_threshold", DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD)
+        ),
+        min_chars=int(getattr(args, "qwen_peer_min_chars", DEFAULT_QWEN_PEER_MIN_CHARS)),
+    )
+    qwen_mode = str(getattr(args, "qwen_peer_mode", "uncertain"))
+    peer_results: dict[str, dict[str, Any]] = {}
+    qwen_attempted = False
+
+    if qwen_models and qwen_mode != "off" and (qwen_mode == "always" or reasons):
+        qwen_attempted = True
+        for index, model_id in enumerate(qwen_models, start=1):
+            key = qwen_peer_key(model_id)
+            peer_results[key] = qwen_peer_review_page(
+                qwen_image_path,
+                ocr_text,
+                endpoint_url=str(getattr(args, "qwen_peer_endpoint_url", "") or getattr(args, "endpoint_url", "")),
+                model_id=model_id,
+                timeout=float(getattr(args, "qwen_peer_timeout", 0.0) or getattr(args, "peer_timeout", 300.0)),
+                max_tokens=int(getattr(args, "qwen_peer_max_tokens", 1024)),
+                seed=int(getattr(args, "seed", 17)) + page_number + index + 1000,
+                max_side=int(getattr(args, "max_side", A4_250DPI_HEIGHT)),
+                image_preprocess=str(getattr(args, "image_preprocess", QWEN_VL_250DPI_PREPROCESSOR)),
+                image_upscale=float(getattr(args, "image_upscale", 1.0)),
+                temperature=float(getattr(args, "temperature", DEFAULT_QWEN_TEMPERATURE)),
+                top_p=float(getattr(args, "top_p", DEFAULT_QWEN_TOP_P)),
+                top_k=int(getattr(args, "top_k", DEFAULT_QWEN_TOP_K)),
+                min_p=float(getattr(args, "min_p", DEFAULT_QWEN_MIN_P)),
+                presence_penalty=float(getattr(args, "presence_penalty", DEFAULT_QWEN_PRESENCE_PENALTY)),
+                enable_thinking=bool(getattr(args, "qwen_peer_enable_thinking", True)),
+                thinking_budget=int(getattr(args, "qwen_peer_thinking_budget", 128)),
+                api_profile=qwen_api_profile,
+                api_key_env=str(getattr(args, "qwen_peer_api_key_env", "") or getattr(args, "qwen_api_key_env", "")),
+                context=context,
+            )
+            peer_results[key]["trigger_reasons"] = reasons or ["qwen_peer_mode:always"]
+
+    cli_fallback = str(getattr(args, "cli_peer_fallback", "auto"))
+    run_cli = False
+    if cli_peers and cli_fallback != "off":
+        if cli_fallback == "always":
+            run_cli = True
+        elif not qwen_models:
+            run_cli = True
+        elif qwen_attempted:
+            run_cli = not peer_results_conclusive(
+                {key: value for key, value in peer_results.items() if key.startswith(QWEN_API_PEER_PREFIX)}
+            )
+        else:
+            run_cli = bool(reasons)
+
+    if run_cli:
+        for peer in cli_peers:
+            peer_results[peer] = run_peer_cli(
+                peer,
+                cli_image_path,
+                ocr_text,
+                timeout=float(getattr(args, "peer_timeout", 300.0)),
+                context=context,
+                opencode_model=str(getattr(args, "opencode_model", DEFAULT_OPENCODE_MODEL_ID)),
+                claude_model=str(getattr(args, "claude_model", DEFAULT_CLAUDE_MODEL_ID)),
+            )
+            peer_results[peer]["fallback_reasons"] = (
+                ["no_qwen_peer_models"]
+                if not qwen_models
+                else (reasons or ["qwen_peer_inconclusive"])
+            )
+    return peer_results
 
 
 def choose_final_text(qwen_result: dict[str, Any], peer_results: dict[str, dict[str, Any]]) -> tuple[str, str]:
@@ -903,7 +1188,8 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
     pages_total = int(pdf_text.get("pages") or 0)
     pages_to_process = min(args.max_pages, pages_total) if pages_total > 0 else args.max_pages
     recovery_pages: list[dict[str, Any]] = []
-    peers = [peer.strip() for peer in args.peers.split(",") if peer.strip()]
+    peers = csv_parts(args.peers)
+    qwen_peer_models = parse_qwen_peer_models(args.qwen_peer_models, api_profile=qwen_peer_api_profile(args))
     with tempfile.TemporaryDirectory(prefix="peti-vlm-ocr-") as temp:
         temp_dir = Path(temp)
         for page_number in range(1, pages_to_process + 1):
@@ -922,19 +1208,14 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
                         page_number=page_number,
                         context=context,
                     )
-                    peer_results = {
-                        peer: run_peer_cli(
-                            peer,
-                            page_image_path,
-                            primary_ocr.get("text", ""),
-                            timeout=args.peer_timeout,
-                            context=context,
-                            opencode_model=args.opencode_model,
-                            claude_model=args.claude_model,
-                        )
-                        for peer in peers
-                        if primary_ocr.get("text")
-                    }
+                    peer_results = run_peer_reviews(
+                        qwen_image_path=page_image_path,
+                        cli_image_path=page_image_path,
+                        primary_ocr=primary_ocr,
+                        args=args,
+                        context=context,
+                        page_number=page_number,
+                    )
                     final_text, final_source = choose_final_text(primary_ocr, peer_results)
                     image_record = {
                         "page_image": page_image["page_image"],
@@ -1012,6 +1293,16 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
             "qwen_api_profile": args.qwen_api_profile,
         },
         "peers": peers,
+        "qwen_peer_models": qwen_peer_models,
+        "peer_policy": {
+            "qwen_peer_mode": args.qwen_peer_mode,
+            "qwen_peer_confidence_threshold": args.qwen_peer_confidence_threshold,
+            "qwen_peer_min_chars": args.qwen_peer_min_chars,
+            "qwen_peer_api_profile": qwen_peer_api_profile(args),
+            "qwen_peer_enable_thinking": args.qwen_peer_enable_thinking,
+            "qwen_peer_thinking_budget": args.qwen_peer_thinking_budget,
+            "cli_peer_fallback": args.cli_peer_fallback,
+        },
         "text": recovered_text,
         "pages": recovery_pages,
     }
@@ -1072,11 +1363,23 @@ def main() -> int:
     parser.add_argument("--thinking-budget", type=int, default=0)
     parser.add_argument("--qwen-api-profile", choices=QWEN_API_PROFILES, default="local")
     parser.add_argument("--qwen-api-key-env", default="")
+    parser.add_argument("--qwen-peer-models", default="", help="comma-separated DashScope/OpenAI qwen peer model ids")
+    parser.add_argument("--qwen-peer-mode", choices=QWEN_PEER_MODES, default="uncertain")
+    parser.add_argument("--qwen-peer-confidence-threshold", type=float, default=DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD)
+    parser.add_argument("--qwen-peer-min-chars", type=int, default=DEFAULT_QWEN_PEER_MIN_CHARS)
+    parser.add_argument("--qwen-peer-endpoint-url", default="", help="empty uses --endpoint-url")
+    parser.add_argument("--qwen-peer-api-profile", default="", help="empty uses --qwen-api-profile")
+    parser.add_argument("--qwen-peer-api-key-env", default="", help="empty uses --qwen-api-key-env")
+    parser.add_argument("--qwen-peer-max-tokens", type=int, default=1024)
+    parser.add_argument("--qwen-peer-timeout", type=float, default=420.0)
+    parser.add_argument("--qwen-peer-enable-thinking", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qwen-peer-thinking-budget", type=int, default=128)
     parser.add_argument("--qwen-timeout", type=float, default=420.0)
     parser.add_argument("--opencode-timeout", type=float, default=180.0)
     parser.add_argument("--claude-timeout", type=float, default=360.0)
     parser.add_argument("--peer-timeout", type=float, default=300.0)
     parser.add_argument("--peers", default="agy,codex", help="comma-separated: agy,codex,claude; empty disables peers")
+    parser.add_argument("--cli-peer-fallback", choices=CLI_PEER_FALLBACK_MODES, default="auto")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--force", action="store_true")
@@ -1095,6 +1398,18 @@ def main() -> int:
         parser.error("--top-k must be non-negative")
     if not 0.0 <= args.min_p <= 1.0:
         parser.error("--min-p must be in [0, 1]")
+    if args.qwen_peer_api_profile and args.qwen_peer_api_profile not in QWEN_API_PROFILES:
+        parser.error(f"--qwen-peer-api-profile must be one of: {', '.join(QWEN_API_PROFILES)}")
+    if not 0.0 <= args.qwen_peer_confidence_threshold <= 1.0:
+        parser.error("--qwen-peer-confidence-threshold must be in [0, 1]")
+    if args.qwen_peer_min_chars < 0:
+        parser.error("--qwen-peer-min-chars must be non-negative")
+    if args.qwen_peer_max_tokens <= 0:
+        parser.error("--qwen-peer-max-tokens must be positive")
+    if args.qwen_peer_timeout <= 0:
+        parser.error("--qwen-peer-timeout must be positive")
+    if args.qwen_peer_thinking_budget < 0:
+        parser.error("--qwen-peer-thinking-budget must be non-negative")
     if args.ocr_backend == "opencode_cli" and not args.opencode_model.strip():
         parser.error("--opencode-model must be non-empty for opencode_cli")
     if args.ocr_backend == "opencode_cli" and not args.opencode_agent.strip():

@@ -32,8 +32,13 @@ from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     DEFAULT_QWEN_TOP_P,
     IMAGE_PREPROCESSORS,
     QWEN_API_PROFILES,
+    CLI_PEER_FALLBACK_MODES,
+    DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD,
+    DEFAULT_QWEN_PEER_MIN_CHARS,
     QWEN_VL_250DPI_SHARP_PREPROCESSOR,
+    QWEN_PEER_MODES,
     choose_final_text,
+    csv_parts,
     image_size,
     iter_ocr_needed_items,
     jsonable,
@@ -47,9 +52,11 @@ from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     parse_sources,
     prepare_ocr_image_bytes,
     qwen_ocr_page,
+    parse_qwen_peer_models,
     render_pdf_page,
     resolve_path,
-    run_peer_cli,
+    run_peer_reviews,
+    qwen_peer_api_profile,
     source_from_item_path,
     write_json,
 )
@@ -426,7 +433,8 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
     pdf_path = resolve_path(pdf_path_text, repo_root)
     pages_total = int(pdf_text.get("pages") or 0)
     pages_to_process = min(args.max_pages, pages_total) if pages_total > 0 else args.max_pages
-    peers = [peer.strip() for peer in args.peers.split(",") if peer.strip()]
+    peers = csv_parts(args.peers)
+    qwen_peer_models = parse_qwen_peer_models(args.qwen_peer_models, api_profile=qwen_peer_api_profile(args))
     recovery_pages: list[dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix=f"peti-{args.job_name}-") as temp:
@@ -457,19 +465,14 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
                         page_number=page_number,
                         context=context,
                     )
-                    peer_results = {
-                        peer: run_peer_cli(
-                            peer,
-                            prepared_path,
-                            primary_ocr.get("text", ""),
-                            timeout=args.peer_timeout,
-                            context=context,
-                            opencode_model=args.opencode_model,
-                            claude_model=args.claude_model,
-                        )
-                        for peer in peers
-                        if primary_ocr.get("text")
-                    }
+                    peer_results = run_peer_reviews(
+                        qwen_image_path=raw_image_path,
+                        cli_image_path=prepared_path,
+                        primary_ocr=primary_ocr,
+                        args=args,
+                        context=context,
+                        page_number=page_number,
+                    )
                     final_text, final_source = choose_final_text(primary_ocr, peer_results)
                     image_records.append(
                         {
@@ -537,6 +540,16 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
             "enable_thinking": args.enable_thinking,
             "thinking_budget": args.thinking_budget,
             "qwen_api_profile": args.qwen_api_profile,
+        },
+        "qwen_peer_models": qwen_peer_models,
+        "peer_policy": {
+            "qwen_peer_mode": args.qwen_peer_mode,
+            "qwen_peer_confidence_threshold": args.qwen_peer_confidence_threshold,
+            "qwen_peer_min_chars": args.qwen_peer_min_chars,
+            "qwen_peer_api_profile": qwen_peer_api_profile(args),
+            "qwen_peer_enable_thinking": args.qwen_peer_enable_thinking,
+            "qwen_peer_thinking_budget": args.qwen_peer_thinking_budget,
+            "cli_peer_fallback": args.cli_peer_fallback,
         },
         "text": recovered_text,
         "pages": recovery_pages,
@@ -674,9 +687,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thinking-budget", type=int, default=0)
     parser.add_argument("--qwen-api-profile", choices=QWEN_API_PROFILES, default="local")
     parser.add_argument("--qwen-api-key-env", default="")
+    parser.add_argument("--qwen-peer-models", default="", help="comma-separated DashScope/OpenAI qwen peer model ids")
+    parser.add_argument("--qwen-peer-mode", choices=QWEN_PEER_MODES, default="uncertain")
+    parser.add_argument("--qwen-peer-confidence-threshold", type=float, default=DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD)
+    parser.add_argument("--qwen-peer-min-chars", type=int, default=DEFAULT_QWEN_PEER_MIN_CHARS)
+    parser.add_argument("--qwen-peer-endpoint-url", default="", help="empty uses --endpoint-url")
+    parser.add_argument("--qwen-peer-api-profile", default="", help="empty uses --qwen-api-profile")
+    parser.add_argument("--qwen-peer-api-key-env", default="", help="empty uses --qwen-api-key-env")
+    parser.add_argument("--qwen-peer-max-tokens", type=int, default=1024)
+    parser.add_argument("--qwen-peer-timeout", type=float, default=420.0)
+    parser.add_argument("--qwen-peer-enable-thinking", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qwen-peer-thinking-budget", type=int, default=128)
     parser.add_argument("--qwen-timeout", type=float, default=600.0)
     parser.add_argument("--primary-cli-timeout", type=float, default=360.0)
     parser.add_argument("--peer-timeout", type=float, default=300.0)
+    parser.add_argument("--cli-peer-fallback", choices=CLI_PEER_FALLBACK_MODES, default="auto")
     parser.add_argument("--agy-agent-file", type=Path, default=DEFAULT_AGY_AGENT_FILE)
     parser.add_argument("--agy-skill-file", type=Path, default=DEFAULT_AGY_SKILL_FILE)
     parser.add_argument("--agy-model", default="")
@@ -721,6 +746,18 @@ def main() -> int:
         raise SystemExit("--max-side must be positive")
     if args.image_upscale <= 0:
         raise SystemExit("--image-upscale must be positive")
+    if args.qwen_peer_api_profile and args.qwen_peer_api_profile not in QWEN_API_PROFILES:
+        raise SystemExit(f"--qwen-peer-api-profile must be one of: {', '.join(QWEN_API_PROFILES)}")
+    if not 0.0 <= args.qwen_peer_confidence_threshold <= 1.0:
+        raise SystemExit("--qwen-peer-confidence-threshold must be in [0, 1]")
+    if args.qwen_peer_min_chars < 0:
+        raise SystemExit("--qwen-peer-min-chars must be non-negative")
+    if args.qwen_peer_max_tokens <= 0:
+        raise SystemExit("--qwen-peer-max-tokens must be positive")
+    if args.qwen_peer_timeout <= 0:
+        raise SystemExit("--qwen-peer-timeout must be positive")
+    if args.qwen_peer_thinking_budget < 0:
+        raise SystemExit("--qwen-peer-thinking-budget must be non-negative")
 
     repo_root = Path.cwd().resolve()
     output_dir = (repo_root / args.output_root / args.job_name).resolve()

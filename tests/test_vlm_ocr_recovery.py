@@ -13,12 +13,16 @@ from scripts.recover_ocr_needed_with_vlm import (
     claude_ocr_page,
     choose_final_text,
     extract_json_object,
+    normalize_qwen_api_model_id,
     opencode_ocr_page,
     page_ocr_images,
+    peer_results_conclusive,
     prepare_ocr_image_bytes,
     qwen_ocr_page,
+    qwen_peer_review_page,
     recovery_scope,
     run_peer_cli,
+    run_peer_reviews,
 )
 
 
@@ -191,6 +195,76 @@ def test_qwen_ocr_page_dashscope_payload_uses_image_url_and_enable_thinking(monk
     assert "presence_penalty" not in payload
     assert result["generation"]["api_profile"] == "dashscope"
     assert result["generation"]["thinking_budget"] == 256
+
+
+def test_normalize_qwen_api_model_id_preserves_local_model_ids():
+    assert normalize_qwen_api_model_id("Qwen3.5-27B", api_profile="dashscope") == "qwen3.5-27b"
+    assert normalize_qwen_api_model_id("Qwen-VL-Max", api_profile="dashscope") == "qwen-vl-max"
+    assert (
+        normalize_qwen_api_model_id("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", api_profile="dashscope")
+        == "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+    )
+    assert normalize_qwen_api_model_id("Qwen3.5-27B", api_profile="local") == "Qwen3.5-27B"
+
+
+def test_qwen_peer_review_page_dashscope_payload(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    seen = {}
+
+    def fake_chat_completion(endpoint_url, payload, timeout, *, api_key_env=""):
+        seen["endpoint_url"] = endpoint_url
+        seen["payload"] = payload
+        seen["timeout"] = timeout
+        seen["api_key_env"] = api_key_env
+        return {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": '{"verdict":"accept","corrected_text":"","issues":[],"confidence":0.92}'
+                    },
+                }
+            ],
+            "usage": {"total_tokens": 77},
+        }
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.openai_chat_completion", fake_chat_completion)
+
+    result = qwen_peer_review_page(
+        page,
+        "관보",
+        endpoint_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        model_id="Qwen3.5-27B",
+        timeout=33,
+        max_tokens=512,
+        seed=9,
+        max_side=100,
+        image_preprocess="none",
+        image_upscale=1.0,
+        temperature=0.2,
+        top_p=0.8,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=1.5,
+        enable_thinking=True,
+        thinking_budget=128,
+        api_profile="dashscope",
+        api_key_env="DASHSCOPE_API_KEY",
+        context="page=1",
+    )
+
+    payload = seen["payload"]
+    assert payload["model"] == "qwen3.5-27b"
+    assert payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "Primary OCR text:" in payload["messages"][0]["content"][0]["text"]
+    assert payload["enable_thinking"] is True
+    assert payload["thinking_budget"] == 128
+    assert "top_k" not in payload
+    assert result["status"] == "ok"
+    assert result["verdict"] == "accept"
+    assert result["model_id"] == "qwen3.5-27b"
+    assert result["usage"]["total_tokens"] == 77
 
 
 def test_qwen_recovery_scope_includes_preprocess_and_generation_settings():
@@ -479,6 +553,126 @@ def test_run_peer_cli_supports_codex_without_user_config(monkeypatch, tmp_path):
     assert seen["command"][:5] == ["codex", "exec", "--ignore-user-config", "--sandbox", "read-only"]
     assert seen["command"][seen["command"].index("-i") + 1] == str(page)
     assert seen["timeout"] == 35
+
+
+def peer_review_args(**overrides):
+    values = {
+        "peers": "codex",
+        "peer_timeout": 20,
+        "opencode_model": "zai-coding-plan/glm-5.2",
+        "claude_model": "",
+        "qwen_peer_models": "Qwen3.5-27B",
+        "qwen_peer_mode": "uncertain",
+        "qwen_peer_confidence_threshold": 0.9,
+        "qwen_peer_min_chars": 10,
+        "qwen_peer_endpoint_url": "",
+        "endpoint_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "qwen_peer_timeout": 30,
+        "qwen_peer_max_tokens": 512,
+        "seed": 17,
+        "max_side": 100,
+        "image_preprocess": "none",
+        "image_upscale": 1.0,
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "qwen_peer_enable_thinking": True,
+        "qwen_peer_thinking_budget": 128,
+        "qwen_peer_api_profile": "dashscope",
+        "qwen_api_profile": "dashscope",
+        "qwen_peer_api_key_env": "DASHSCOPE_API_KEY",
+        "qwen_api_key_env": "DASHSCOPE_API_KEY",
+        "cli_peer_fallback": "auto",
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def test_run_peer_reviews_skips_api_and_cli_when_primary_confident(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+
+    def fail_qwen(*args, **kwargs):
+        raise AssertionError("qwen peer should not run for confident primary")
+
+    def fail_cli(*args, **kwargs):
+        raise AssertionError("cli fallback should not run for confident primary")
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.qwen_peer_review_page", fail_qwen)
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.run_peer_cli", fail_cli)
+
+    result = run_peer_reviews(
+        qwen_image_path=page,
+        cli_image_path=page,
+        primary_ocr={"status": "ok", "text": "가" * 100, "confidence": 0.95, "finish_reason": "stop"},
+        args=peer_review_args(),
+        context="page=1",
+        page_number=1,
+    )
+
+    assert result == {}
+
+
+def test_run_peer_reviews_qwen_accept_suppresses_cli_fallback(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    calls = {"qwen": 0, "cli": 0}
+
+    def fake_qwen(*args, **kwargs):
+        calls["qwen"] += 1
+        return {"status": "ok", "verdict": "accept", "corrected_text": "", "issues": [], "confidence": 0.91}
+
+    def fake_cli(*args, **kwargs):
+        calls["cli"] += 1
+        return {"status": "ok", "verdict": "accept", "corrected_text": "", "issues": [], "confidence": 0.9}
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.qwen_peer_review_page", fake_qwen)
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.run_peer_cli", fake_cli)
+
+    result = run_peer_reviews(
+        qwen_image_path=page,
+        cli_image_path=page,
+        primary_ocr={"status": "ok", "text": "관보", "confidence": 0.6, "finish_reason": "stop"},
+        args=peer_review_args(),
+        context="page=1",
+        page_number=1,
+    )
+
+    assert calls == {"qwen": 1, "cli": 0}
+    assert result["qwen_api:qwen3.5-27b"]["verdict"] == "accept"
+    assert peer_results_conclusive(result) is True
+
+
+def test_run_peer_reviews_cli_fallback_after_inconclusive_qwen(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    calls = {"qwen": 0, "cli": 0}
+
+    def fake_qwen(*args, **kwargs):
+        calls["qwen"] += 1
+        return {"status": "unparsed", "verdict": "", "corrected_text": "", "issues": [], "confidence": 0.0}
+
+    def fake_cli(*args, **kwargs):
+        calls["cli"] += 1
+        return {"status": "ok", "verdict": "revise", "corrected_text": "검증 교정", "issues": [], "confidence": 0.92}
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.qwen_peer_review_page", fake_qwen)
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.run_peer_cli", fake_cli)
+
+    result = run_peer_reviews(
+        qwen_image_path=page,
+        cli_image_path=page,
+        primary_ocr={"status": "ok", "text": "관보", "confidence": 0.6, "finish_reason": "stop"},
+        args=peer_review_args(),
+        context="page=1",
+        page_number=1,
+    )
+
+    assert calls == {"qwen": 1, "cli": 1}
+    assert result["codex"]["verdict"] == "revise"
+    assert result["codex"]["fallback_reasons"]
 
 
 def test_choose_final_text_uses_high_confidence_peer_revision():
