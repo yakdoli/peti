@@ -32,6 +32,7 @@ DEFAULT_MODEL_ID = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 DEFAULT_OPENCODE_MODEL_ID = "zai-coding-plan/glm-5.2"
 DEFAULT_OPENCODE_AGENT_ID = "peti-ocr-primary"
 DEFAULT_CLAUDE_MODEL_ID = ""
+CLAUDE_EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 A4_250DPI_WIDTH = 2480
 A4_250DPI_HEIGHT = 3508
 QWEN_VL_250DPI_PREPROCESSOR = "qwen_vl_250dpi"
@@ -593,6 +594,9 @@ def claude_ocr_page(
         "--add-dir",
         str(attachment_path.parent),
         "--safe-mode",
+        "--strict-mcp-config",
+        "--mcp-config",
+        CLAUDE_EMPTY_MCP_CONFIG,
         "--tools",
         "Read",
         "--no-session-persistence",
@@ -763,6 +767,9 @@ def run_peer_cli(
             "--add-dir",
             str(image_path.parent),
             "--safe-mode",
+            "--strict-mcp-config",
+            "--mcp-config",
+            CLAUDE_EMPTY_MCP_CONFIG,
             "--tools",
             "Read",
             "--no-session-persistence",

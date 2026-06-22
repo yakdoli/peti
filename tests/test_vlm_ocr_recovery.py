@@ -270,6 +270,8 @@ def test_claude_ocr_page_uses_read_only_image_access(monkeypatch, tmp_path):
     assert seen["command"][:2] == ["claude", "-p"]
     assert "--permission-mode" in seen["command"]
     assert "--safe-mode" in seen["command"]
+    assert "--strict-mcp-config" in seen["command"]
+    assert seen["command"][seen["command"].index("--mcp-config") + 1] == '{"mcpServers":{}}'
     assert seen["command"][seen["command"].index("--tools") + 1] == "Read"
     assert seen["command"][seen["command"].index("--model") + 1] == "sonnet"
     assert f"![page]({page.resolve()})" in seen["command"][2]
@@ -327,6 +329,8 @@ def test_run_peer_cli_supports_claude_agent(monkeypatch, tmp_path):
     assert result["verdict"] == "accept"
     assert seen["command"][:2] == ["claude", "-p"]
     assert "--safe-mode" in seen["command"]
+    assert "--strict-mcp-config" in seen["command"]
+    assert seen["command"][seen["command"].index("--mcp-config") + 1] == '{"mcpServers":{}}'
     assert seen["command"][seen["command"].index("--tools") + 1] == "Read"
     assert seen["command"][seen["command"].index("--model") + 1] == "sonnet"
     assert "Primary OCR text:" in seen["command"][2]
