@@ -228,7 +228,7 @@ def test_agy_primary_falls_back_to_opencode(monkeypatch, tmp_path):
         agy_add_dir=None,
         agy_dangerously_skip_permissions=True,
         agy_fallback_backend="opencode_cli",
-        opencode_fallback_model="zai-coding-plan/glm-5v-turbo",
+        opencode_fallback_model="zai-coding-plan/glm-5.2",
         opencode_fallback_agent="peti-ocr-primary",
         opencode_fallback_timeout=77,
         opencode_pure=False,
@@ -251,7 +251,7 @@ def test_agy_primary_falls_back_to_opencode(monkeypatch, tmp_path):
     assert result["fallback_reason"] == "empty"
     assert result["fallback_from"]["engine"] == "agy_cli"
     assert seen["opencode"]["image_path"] == prepared
-    assert seen["opencode"]["model_id"] == "zai-coding-plan/glm-5v-turbo"
+    assert seen["opencode"]["model_id"] == "zai-coding-plan/glm-5.2"
     assert seen["opencode"]["agent_id"] == "peti-ocr-primary"
     assert seen["opencode"]["timeout"] == 77
     assert seen["opencode"]["pure"] is False
@@ -284,7 +284,7 @@ def test_opencode_primary_backend(monkeypatch, tmp_path):
 
     args = Namespace(
         primary="opencode_cli",
-        opencode_model="zai-coding-plan/glm-5v-turbo",
+        opencode_model="zai-coding-plan/glm-5.2",
         opencode_agent="peti-ocr-primary",
         opencode_timeout=88,
         opencode_pure=False,
@@ -304,7 +304,7 @@ def test_opencode_primary_backend(monkeypatch, tmp_path):
     assert result["engine"] == "opencode_cli"
     assert result["text"] == "관보"
     assert seen["image_path"] == prepared
-    assert seen["model_id"] == "zai-coding-plan/glm-5v-turbo"
+    assert seen["model_id"] == "zai-coding-plan/glm-5.2"
     assert seen["agent_id"] == "peti-ocr-primary"
     assert seen["timeout"] == 88
     assert seen["pure"] is False

@@ -180,7 +180,7 @@ def test_opencode_ocr_page_uses_file_attachment(monkeypatch, tmp_path):
 
     result = opencode_ocr_page(
         page,
-        model_id="zai-coding-plan/glm-5v-turbo",
+        model_id="zai-coding-plan/glm-5.2",
         agent_id="peti-ocr-primary",
         timeout=12,
         max_side=100,
@@ -200,7 +200,7 @@ def test_opencode_ocr_page_uses_file_attachment(monkeypatch, tmp_path):
         "--agent",
         "peti-ocr-primary",
         "-m",
-        "zai-coding-plan/glm-5v-turbo",
+        "zai-coding-plan/glm-5.2",
     ]
     file_index = seen["command"].index("--file")
     assert seen["command"][file_index + 1] == str(page)
@@ -230,7 +230,7 @@ def test_opencode_ocr_page_downscales_file_attachment(monkeypatch, tmp_path):
 
     result = opencode_ocr_page(
         page,
-        model_id="zai-coding-plan/glm-5v-turbo",
+        model_id="zai-coding-plan/glm-5.2",
         agent_id="peti-ocr-primary",
         timeout=12,
         max_side=50,
@@ -299,7 +299,7 @@ def test_run_peer_cli_supports_opencode_agent(monkeypatch, tmp_path):
         "--agent",
         "peti-ocr-peer",
         "-m",
-        "zai-coding-plan/glm-5v-turbo",
+        "zai-coding-plan/glm-5.2",
     ]
     assert seen["command"][7:9] == ["--file", str(page)]
     assert seen["command"][9] == "--"
