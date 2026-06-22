@@ -470,6 +470,58 @@ def test_agy_primary_can_fall_back_to_claude(monkeypatch, tmp_path):
     assert seen["timeout"] == 66
 
 
+def test_qwen_primary_passes_rate_limit_fallback_models(monkeypatch, tmp_path):
+    raw = tmp_path / "raw.png"
+    prepared = tmp_path / "prepared.png"
+    raw.write_bytes(b"raw")
+    prepared.write_bytes(b"prepared")
+    seen = {}
+
+    def fake_qwen(image_path, **kwargs):
+        seen["image_path"] = image_path
+        seen.update(kwargs)
+        return {"engine": "qwen_vllm", "status": "ok", "text": "관보", "confidence": 0.8}
+
+    monkeypatch.setattr("scripts.run_vlm_ocr_batch_job.qwen_ocr_page", fake_qwen)
+
+    args = Namespace(
+        primary="qwen_vllm",
+        endpoint_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        model_id="qwen3.6-plus",
+        qwen_timeout=30,
+        max_tokens=1024,
+        seed=17,
+        max_side=3508,
+        image_preprocess="qwen_vl_250dpi_sharp",
+        image_upscale=1.1,
+        temperature=0.2,
+        top_p=0.8,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=1.5,
+        enable_thinking=True,
+        thinking_budget=128,
+        qwen_api_profile="dashscope",
+        qwen_api_key_env="DASHSCOPE_API_KEY",
+        qwen_rate_limit_fallback_models="qwen3.7-plus,qwen-3.7-max-preview",
+    )
+
+    result = run_primary_ocr_page(
+        raw,
+        prepared,
+        {"width": 100, "height": 200},
+        args=args,
+        page_number=2,
+        context="page=2",
+    )
+
+    assert result["status"] == "ok"
+    assert seen["image_path"] == raw
+    assert seen["model_id"] == "qwen3.6-plus"
+    assert seen["seed"] == 19
+    assert seen["rate_limit_fallback_models"] == "qwen3.7-plus,qwen-3.7-max-preview"
+
+
 def test_cli_primary_ocr_page_supports_codex(monkeypatch, tmp_path):
     image = tmp_path / "page.png"
     image.write_bytes(b"fake")

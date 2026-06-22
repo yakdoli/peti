@@ -13,9 +13,11 @@ from scripts.recover_ocr_needed_with_vlm import (
     claude_ocr_page,
     choose_final_text,
     extract_json_object,
+    is_rate_limit_response,
     normalize_qwen_api_model_id,
     opencode_ocr_page,
     page_ocr_images,
+    parse_qwen_api_models,
     peer_results_conclusive,
     prepare_ocr_image_bytes,
     qwen_ocr_page,
@@ -197,14 +199,76 @@ def test_qwen_ocr_page_dashscope_payload_uses_image_url_and_enable_thinking(monk
     assert result["generation"]["thinking_budget"] == 256
 
 
+def test_qwen_ocr_page_uses_rate_limit_fallback_model(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    calls = []
+
+    def fake_chat_completion(endpoint_url, payload, timeout, *, api_key_env=""):
+        calls.append(payload["model"])
+        if len(calls) == 1:
+            return {"_error": {"type": "http_error", "status": 429, "body": "rate limit exceeded"}}
+        return {
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"text":"관보","confidence":0.82}'}}],
+            "usage": {"total_tokens": 88},
+        }
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.openai_chat_completion", fake_chat_completion)
+
+    result = qwen_ocr_page(
+        page,
+        endpoint_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        model_id="qwen3.6-plus",
+        timeout=22,
+        max_tokens=1024,
+        seed=3,
+        max_side=100,
+        image_preprocess="none",
+        image_upscale=1.0,
+        temperature=0.2,
+        top_p=0.8,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=1.5,
+        enable_thinking=True,
+        thinking_budget=128,
+        api_profile="dashscope",
+        api_key_env="DASHSCOPE_API_KEY",
+        rate_limit_fallback_models="qwen3.7-plus,qwen-3.7-max",
+        context="page=1",
+    )
+
+    assert calls == ["qwen3.6-plus", "qwen3.7-plus"]
+    assert result["status"] == "ok"
+    assert result["model_id"] == "qwen3.7-plus"
+    assert result["fallback_from_model_id"] == "qwen3.6-plus"
+    assert result["rate_limit_fallback_attempts"][0]["rate_limited"] is True
+    assert result["generation"]["rate_limit_fallback_models"] == ["qwen3.7-plus", "qwen3.7-max"]
+
+
 def test_normalize_qwen_api_model_id_preserves_local_model_ids():
     assert normalize_qwen_api_model_id("Qwen3.5-27B", api_profile="dashscope") == "qwen3.5-27b"
     assert normalize_qwen_api_model_id("Qwen-VL-Max", api_profile="dashscope") == "qwen-vl-max"
+    assert normalize_qwen_api_model_id("Qwen-3.7-Max-Preview", api_profile="dashscope") == "qwen3.7-max-preview"
     assert (
         normalize_qwen_api_model_id("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", api_profile="dashscope")
         == "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
     )
     assert normalize_qwen_api_model_id("Qwen3.5-27B", api_profile="local") == "Qwen3.5-27B"
+    assert parse_qwen_api_models("qwen3.7-plus,Qwen-3.7-Max", api_profile="dashscope") == [
+        "qwen3.7-plus",
+        "qwen3.7-max",
+    ]
+    assert parse_qwen_api_models(
+        "qwen3.7-plus,qwen-3.6-max-preview,qwen-3.7-max,qwen-3.7-max-preview",
+        api_profile="dashscope",
+    ) == [
+        "qwen3.7-plus",
+        "qwen3.6-max-preview",
+        "qwen3.7-max",
+        "qwen3.7-max-preview",
+    ]
+    assert is_rate_limit_response({"_error": {"status": 429, "body": "too many requests"}}) is True
 
 
 def test_qwen_peer_review_page_dashscope_payload(monkeypatch, tmp_path):

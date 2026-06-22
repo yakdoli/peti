@@ -35,6 +35,7 @@ from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     CLI_PEER_FALLBACK_MODES,
     DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD,
     DEFAULT_QWEN_PEER_MIN_CHARS,
+    DEFAULT_QWEN_RATE_LIMIT_FALLBACK_MODELS_CSV,
     QWEN_VL_250DPI_SHARP_PREPROCESSOR,
     QWEN_PEER_MODES,
     choose_final_text,
@@ -49,6 +50,7 @@ from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     opencode_ocr_page,
     page_image_context,
     page_ocr_images,
+    parse_qwen_api_models,
     parse_sources,
     prepare_ocr_image_bytes,
     qwen_ocr_page,
@@ -340,6 +342,7 @@ def run_primary_ocr_page(
             thinking_budget=args.thinking_budget,
             api_profile=args.qwen_api_profile,
             api_key_env=args.qwen_api_key_env,
+            rate_limit_fallback_models=getattr(args, "qwen_rate_limit_fallback_models", ""),
             context=context,
         )
     if args.primary == "opencode_cli":
@@ -540,6 +543,10 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
             "enable_thinking": args.enable_thinking,
             "thinking_budget": args.thinking_budget,
             "qwen_api_profile": args.qwen_api_profile,
+            "qwen_rate_limit_fallback_models": parse_qwen_api_models(
+                getattr(args, "qwen_rate_limit_fallback_models", ""),
+                api_profile=args.qwen_api_profile,
+            ),
         },
         "qwen_peer_models": qwen_peer_models,
         "peer_policy": {
@@ -687,6 +694,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thinking-budget", type=int, default=0)
     parser.add_argument("--qwen-api-profile", choices=QWEN_API_PROFILES, default="local")
     parser.add_argument("--qwen-api-key-env", default="")
+    parser.add_argument(
+        "--qwen-rate-limit-fallback-models",
+        default=DEFAULT_QWEN_RATE_LIMIT_FALLBACK_MODELS_CSV,
+        help="comma-separated qwen_vllm model ids tried only after an API rate-limit response",
+    )
     parser.add_argument("--qwen-peer-models", default="", help="comma-separated DashScope/OpenAI qwen peer model ids")
     parser.add_argument("--qwen-peer-mode", choices=QWEN_PEER_MODES, default="uncertain")
     parser.add_argument("--qwen-peer-confidence-threshold", type=float, default=DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD)

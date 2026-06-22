@@ -52,6 +52,13 @@ QWEN_API_PROFILES = ("local", "dashscope")
 QWEN_PEER_MODES = ("off", "uncertain", "always")
 CLI_PEER_FALLBACK_MODES = ("auto", "always", "off")
 QWEN_API_PEER_PREFIX = "qwen_api:"
+DEFAULT_QWEN_RATE_LIMIT_FALLBACK_MODELS = (
+    "qwen3.7-plus",
+    "qwen-3.6-max-preview",
+    "qwen-3.7-max",
+    "qwen-3.7-max-preview",
+)
+DEFAULT_QWEN_RATE_LIMIT_FALLBACK_MODELS_CSV = ",".join(DEFAULT_QWEN_RATE_LIMIT_FALLBACK_MODELS)
 DEFAULT_QWEN_TEMPERATURE = 0.2
 DEFAULT_QWEN_TOP_P = 0.8
 DEFAULT_QWEN_TOP_K = 20
@@ -89,7 +96,8 @@ def csv_parts(value: str) -> list[str]:
 def normalize_qwen_api_model_id(model_id: str, *, api_profile: str = "local") -> str:
     candidate = str(model_id or "").strip()
     if api_profile == "dashscope" and "/" not in candidate and candidate.lower().startswith("qwen"):
-        return candidate.lower()
+        normalized = candidate.lower()
+        return re.sub(r"^qwen-(?=\d)", "qwen", normalized)
     return candidate
 
 
@@ -98,6 +106,10 @@ def qwen_peer_api_profile(args: argparse.Namespace) -> str:
 
 
 def parse_qwen_peer_models(value: str, *, api_profile: str = "local") -> list[str]:
+    return [normalize_qwen_api_model_id(model, api_profile=api_profile) for model in csv_parts(value)]
+
+
+def parse_qwen_api_models(value: str, *, api_profile: str = "local") -> list[str]:
     return [normalize_qwen_api_model_id(model, api_profile=api_profile) for model in csv_parts(value)]
 
 
@@ -383,8 +395,58 @@ def openai_chat_completion(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return None
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        parsed: Any = {}
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {}
+        return {
+            "_error": {
+                "type": "http_error",
+                "status": exc.code,
+                "reason": str(exc.reason),
+                "body": body[-4000:],
+                "parsed": parsed,
+            },
+            "error": parsed.get("error", parsed) if isinstance(parsed, dict) else parsed,
+        }
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return {"_error": {"type": type(exc).__name__, "message": str(exc)}}
+
+
+def openai_error_summary(data: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    error = data.get("_error")
+    if isinstance(error, dict):
+        return error
+    return {}
+
+
+def is_rate_limit_response(data: dict[str, Any] | None) -> bool:
+    error = openai_error_summary(data)
+    if not error:
+        return False
+    try:
+        if int(error.get("status") or 0) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = json.dumps(error, ensure_ascii=False).lower()
+    return any(
+        marker in text
+        for marker in (
+            "rate limit",
+            "ratelimit",
+            "too many requests",
+            "quota",
+            "throttl",
+            "insufficient_quota",
+            "resourceexhausted",
+        )
+    )
 
 
 def message_content(data: dict[str, Any] | None) -> str:
@@ -507,10 +569,16 @@ def qwen_ocr_page(
     thinking_budget: int = 0,
     api_profile: str = "local",
     api_key_env: str = "",
+    rate_limit_fallback_models: str = "",
     context: str = "",
 ) -> dict[str, Any]:
     prompt = ocr_prompt(context)
     request_model_id = normalize_qwen_api_model_id(model_id, api_profile=api_profile)
+    fallback_models = parse_qwen_api_models(rate_limit_fallback_models, api_profile=api_profile)
+    model_attempts = [request_model_id]
+    for fallback_model in fallback_models:
+        if fallback_model and fallback_model not in model_attempts:
+            model_attempts.append(fallback_model)
     image_url, image_metadata = prepared_image_data_url(
         image_path,
         max_side=max_side,
@@ -518,7 +586,6 @@ def qwen_ocr_page(
         upscale=image_upscale,
     )
     payload = {
-        "model": request_model_id,
         "messages": [
             {
                 "role": "user",
@@ -543,10 +610,31 @@ def qwen_ocr_page(
         payload["presence_penalty"] = presence_penalty
         payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
     started_at = time.perf_counter()
-    response = openai_chat_completion(endpoint_url, payload, timeout, api_key_env=api_key_env)
+    response: dict[str, Any] | None = None
+    used_model_id = request_model_id
+    attempts: list[dict[str, Any]] = []
+    for attempt_index, attempt_model_id in enumerate(model_attempts):
+        used_model_id = attempt_model_id
+        attempt_payload = {**payload, "model": attempt_model_id}
+        attempt_started = time.perf_counter()
+        response = openai_chat_completion(endpoint_url, attempt_payload, timeout, api_key_env=api_key_env)
+        attempt_duration_s = time.perf_counter() - attempt_started
+        error = openai_error_summary(response)
+        rate_limited = is_rate_limit_response(response)
+        attempts.append(
+            {
+                "model_id": attempt_model_id,
+                "duration_s": round(attempt_duration_s, 3),
+                "rate_limited": rate_limited,
+                "error": error,
+            }
+        )
+        if rate_limited and attempt_index + 1 < len(model_attempts):
+            continue
+        break
     duration_s = time.perf_counter() - started_at
     raw = message_content(response)
-    result = ocr_result_from_response(raw, engine="qwen_vllm", model_id=request_model_id)
+    result = ocr_result_from_response(raw, engine="qwen_vllm", model_id=used_model_id)
     choice = {}
     try:
         choice = response["choices"][0] if response else {}
@@ -564,10 +652,21 @@ def qwen_ocr_page(
         "enable_thinking": enable_thinking,
         "thinking_budget": thinking_budget,
         "api_profile": api_profile,
+        "requested_model_id": request_model_id,
+        "rate_limit_fallback_models": fallback_models,
     }
     result["duration_s"] = duration_s
     result["usage"] = response.get("usage", {}) if isinstance(response, dict) else {}
     result["finish_reason"] = choice.get("finish_reason", "") if isinstance(choice, dict) else ""
+    error = openai_error_summary(response)
+    if error:
+        result["api_error"] = error
+        if result.get("status") == "empty":
+            result["status"] = "error"
+    if len(attempts) > 1 or any(attempt.get("rate_limited") for attempt in attempts):
+        result["rate_limit_fallback_attempts"] = attempts
+        if used_model_id != request_model_id:
+            result["fallback_from_model_id"] = request_model_id
     return result
 
 
@@ -751,6 +850,7 @@ def run_primary_ocr_page(
         thinking_budget=args.thinking_budget,
         api_profile=args.qwen_api_profile,
         api_key_env=args.qwen_api_key_env,
+        rate_limit_fallback_models=getattr(args, "qwen_rate_limit_fallback_models", ""),
         context=context,
     )
 
@@ -1313,6 +1413,10 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
             "enable_thinking": args.enable_thinking,
             "thinking_budget": args.thinking_budget,
             "qwen_api_profile": args.qwen_api_profile,
+            "qwen_rate_limit_fallback_models": parse_qwen_api_models(
+                getattr(args, "qwen_rate_limit_fallback_models", ""),
+                api_profile=args.qwen_api_profile,
+            ),
         },
         "peers": peers,
         "qwen_peer_models": qwen_peer_models,
@@ -1385,6 +1489,11 @@ def main() -> int:
     parser.add_argument("--thinking-budget", type=int, default=0)
     parser.add_argument("--qwen-api-profile", choices=QWEN_API_PROFILES, default="local")
     parser.add_argument("--qwen-api-key-env", default="")
+    parser.add_argument(
+        "--qwen-rate-limit-fallback-models",
+        default=DEFAULT_QWEN_RATE_LIMIT_FALLBACK_MODELS_CSV,
+        help="comma-separated qwen_vllm model ids tried only after an API rate-limit response",
+    )
     parser.add_argument("--qwen-peer-models", default="", help="comma-separated DashScope/OpenAI qwen peer model ids")
     parser.add_argument("--qwen-peer-mode", choices=QWEN_PEER_MODES, default="uncertain")
     parser.add_argument("--qwen-peer-confidence-threshold", type=float, default=DEFAULT_QWEN_PEER_CONFIDENCE_THRESHOLD)
