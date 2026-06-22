@@ -306,6 +306,33 @@ def test_run_peer_cli_supports_vibe_agent(monkeypatch, tmp_path):
     assert seen["timeout"] == 35
 
 
+def test_run_peer_cli_supports_agy_image_access(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"verdict":"accept","corrected_text":"","issues":[],"confidence":0.8}'
+        stderr = ""
+
+    def fake_run(command, capture_output, text, timeout, check):
+        seen["command"] = command
+        seen["timeout"] = timeout
+        return Completed()
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.subprocess.run", fake_run)
+
+    result = run_peer_cli("agy", page, "primary text", timeout=20, context="page=1")
+
+    assert result["status"] == "ok"
+    assert result["verdict"] == "accept"
+    assert seen["command"][:2] == ["agy", "-p"]
+    assert seen["command"][seen["command"].index("--add-dir") + 1] == str(page.parent)
+    assert "--dangerously-skip-permissions" in seen["command"]
+    assert seen["timeout"] == 35
+
+
 def test_run_peer_cli_supports_claude_agent(monkeypatch, tmp_path):
     page = tmp_path / "page.png"
     Image.new("RGB", (100, 100), "white").save(page)

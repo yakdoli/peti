@@ -717,7 +717,16 @@ def run_peer_cli(
 ) -> dict[str, Any]:
     prompt = peer_prompt(ocr_text, image_path, context=context)
     if peer == "agy":
-        command = ["agy", "-p", prompt, "--print-timeout", f"{max(1, int(round(timeout)))}s"]
+        command = [
+            "agy",
+            "-p",
+            prompt,
+            "--print-timeout",
+            f"{max(1, int(round(timeout)))}s",
+            "--add-dir",
+            str(image_path.parent),
+            "--dangerously-skip-permissions",
+        ]
     elif peer == "vibe":
         command = [
             "vibe",
