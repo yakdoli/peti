@@ -1050,6 +1050,8 @@ def peer_result_conclusive(result: dict[str, Any]) -> bool:
         return True
     if verdict == "revise" and result.get("corrected_text") and confidence >= 0.8:
         return True
+    if verdict == "reject" and confidence >= 0.85:
+        return True
     return False
 
 
@@ -1157,6 +1159,13 @@ def choose_final_text(qwen_result: dict[str, Any], peer_results: dict[str, dict[
     if revisions:
         revisions.sort(key=lambda item: item[0], reverse=True)
         return str(revisions[0][1]), "peer_revision"
+    rejects = [
+        peer_confidence(result)
+        for result in peer_results.values()
+        if result.get("status") == "ok" and result.get("verdict") == "reject" and peer_confidence(result) >= 0.85
+    ]
+    if rejects:
+        return str(qwen_result.get("text", "")), "peer_rejected_primary"
     engine = str(qwen_result.get("engine") or "primary")
     source = "qwen_primary" if engine == "qwen_vllm" else f"{engine}_primary"
     return str(qwen_result.get("text", "")), source

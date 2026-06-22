@@ -675,6 +675,36 @@ def test_run_peer_reviews_cli_fallback_after_inconclusive_qwen(monkeypatch, tmp_
     assert result["codex"]["fallback_reasons"]
 
 
+def test_run_peer_reviews_qwen_reject_suppresses_cli_fallback(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    calls = {"qwen": 0, "cli": 0}
+
+    def fake_qwen(*args, **kwargs):
+        calls["qwen"] += 1
+        return {"status": "ok", "verdict": "reject", "corrected_text": "", "issues": ["bad"], "confidence": 0.91}
+
+    def fake_cli(*args, **kwargs):
+        calls["cli"] += 1
+        return {"status": "ok", "verdict": "accept", "corrected_text": "", "issues": [], "confidence": 0.9}
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.qwen_peer_review_page", fake_qwen)
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.run_peer_cli", fake_cli)
+
+    result = run_peer_reviews(
+        qwen_image_path=page,
+        cli_image_path=page,
+        primary_ocr={"status": "ok", "text": "관보", "confidence": 0.6, "finish_reason": "stop"},
+        args=peer_review_args(),
+        context="page=1",
+        page_number=1,
+    )
+
+    assert calls == {"qwen": 1, "cli": 0}
+    assert result["qwen_api:qwen3.5-27b"]["verdict"] == "reject"
+    assert peer_results_conclusive(result) is True
+
+
 def test_choose_final_text_uses_high_confidence_peer_revision():
     primary = {"engine": "opencode_cli", "text": "원문"}
     low_confidence = {
@@ -695,6 +725,19 @@ def test_choose_final_text_uses_high_confidence_peer_revision():
         "검증 교정",
         "peer_revision",
     )
+
+
+def test_choose_final_text_marks_high_confidence_peer_reject():
+    primary = {"engine": "qwen_vllm", "text": "원문"}
+    reject = {
+        "status": "ok",
+        "verdict": "reject",
+        "corrected_text": "",
+        "issues": ["table mismatch"],
+        "confidence": 0.9,
+    }
+
+    assert choose_final_text(primary, {"qwen_api:qwen3.5-27b": reject}) == ("원문", "peer_rejected_primary")
 
 
 def test_extract_json_object_prefers_final_verdict_object():
