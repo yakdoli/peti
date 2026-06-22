@@ -356,7 +356,63 @@ def test_claude_primary_backend(monkeypatch, tmp_path):
     assert seen["max_side"] == 3508
 
 
-def test_agy_primary_falls_back_to_claude_by_default(monkeypatch, tmp_path):
+def test_agy_primary_falls_back_to_codex_by_default(monkeypatch, tmp_path):
+    raw = tmp_path / "raw.png"
+    prepared = tmp_path / "prepared.png"
+    raw.write_bytes(b"raw")
+    prepared.write_bytes(b"prepared")
+    seen = {}
+
+    def fake_cli_primary(image_path, *, backend, timeout, context, input_image, **_kwargs):
+        if backend == "agy_cli":
+            return {"engine": "agy_cli", "status": "empty", "text": "", "confidence": 0.0}
+        seen.update(
+            {
+                "image_path": image_path,
+                "backend": backend,
+                "timeout": timeout,
+                "context": context,
+                "input_image": input_image,
+            }
+        )
+        return {"engine": "codex_cli", "status": "ok", "text": "관보", "confidence": 0.85}
+
+    monkeypatch.setattr("scripts.run_vlm_ocr_batch_job.cli_primary_ocr_page", fake_cli_primary)
+
+    args = Namespace(
+        primary="agy_cli",
+        primary_cli_timeout=30,
+        max_side=3508,
+        agy_agent_file=Path(".agy/agents/peti-ocr-primary.md"),
+        agy_skill_file=Path(".agy/skills/peti-korean-ocr-primary/SKILL.md"),
+        agy_model="",
+        agy_add_dir=None,
+        agy_dangerously_skip_permissions=True,
+        agy_fallback_backend="codex_cli",
+        codex_fallback_timeout=66,
+    )
+
+    result = run_primary_ocr_page(
+        raw,
+        prepared,
+        {"width": 100, "height": 200},
+        args=args,
+        page_number=1,
+        context="page=1",
+    )
+
+    assert result["status"] == "ok"
+    assert result["engine"] == "codex_cli"
+    assert result["fallback_backend"] == "codex_cli"
+    assert result["fallback_reason"] == "empty"
+    assert result["fallback_from"]["engine"] == "agy_cli"
+    assert seen["image_path"] == prepared
+    assert seen["backend"] == "codex_cli"
+    assert seen["timeout"] == 66
+    assert "fallback_from=agy_cli" in seen["context"]
+
+
+def test_agy_primary_can_fall_back_to_claude(monkeypatch, tmp_path):
     raw = tmp_path / "raw.png"
     prepared = tmp_path / "prepared.png"
     raw.write_bytes(b"raw")

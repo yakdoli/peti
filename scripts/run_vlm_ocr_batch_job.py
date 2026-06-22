@@ -54,7 +54,7 @@ from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
 )
 
 PRIMARY_BACKENDS = ("qwen_vllm", "agy_cli", "opencode_cli", "claude_cli", "codex_cli")
-AGY_FALLBACK_BACKENDS = ("none", "opencode_cli", "claude_cli")
+AGY_FALLBACK_BACKENDS = ("none", "codex_cli", "opencode_cli", "claude_cli")
 DEFAULT_AGY_AGENT_FILE = Path(".agy/agents/peti-ocr-primary.md")
 DEFAULT_AGY_SKILL_FILE = Path(".agy/skills/peti-korean-ocr-primary/SKILL.md")
 
@@ -354,11 +354,19 @@ def run_primary_ocr_page(
     )
     if (
         args.primary == "agy_cli"
-        and args.agy_fallback_backend in {"opencode_cli", "claude_cli"}
+        and args.agy_fallback_backend in {"codex_cli", "opencode_cli", "claude_cli"}
         and primary.get("status") in {"empty", "error"}
     ):
         started = time.perf_counter()
-        if args.agy_fallback_backend == "claude_cli":
+        if args.agy_fallback_backend == "codex_cli":
+            fallback = cli_primary_ocr_page(
+                prepared_page_image,
+                backend="codex_cli",
+                timeout=args.codex_fallback_timeout,
+                context=f"{context}, fallback_from=agy_cli",
+                input_image=prepared_metadata,
+            )
+        elif args.agy_fallback_backend == "claude_cli":
             fallback = claude_ocr_page(
                 prepared_page_image,
                 model_id=args.claude_fallback_model,
@@ -655,7 +663,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agy-model", default="")
     parser.add_argument("--agy-add-dir", type=Path)
     parser.add_argument("--agy-dangerously-skip-permissions", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--agy-fallback-backend", choices=AGY_FALLBACK_BACKENDS, default="claude_cli")
+    parser.add_argument("--agy-fallback-backend", choices=AGY_FALLBACK_BACKENDS, default="codex_cli")
+    parser.add_argument("--codex-fallback-timeout", type=float, default=360.0)
     parser.add_argument("--opencode-model", default=DEFAULT_OPENCODE_MODEL_ID)
     parser.add_argument("--opencode-agent", default=DEFAULT_OPENCODE_AGENT_ID)
     parser.add_argument("--opencode-timeout", type=float, default=240.0)
