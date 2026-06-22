@@ -762,6 +762,8 @@ def peer_prompt(ocr_text: str, image_path: Path, context: str = "") -> str:
             "Compare the OCR text against the attached/local image. Do not transcribe the whole image unless needed.",
             "Return exactly one JSON object: {\"verdict\":\"accept|revise|reject\",\"corrected_text\":\"...\",\"issues\":[\"...\"],\"confidence\":0.0}.",
             "Use accept when the OCR is good enough. Use revise only when you can correct visible errors.",
+            "Use revise only for compact local corrections; keep corrected_text under 2000 characters.",
+            "If the OCR has broad layout/table errors or would require full-page retranscription, use reject with issues instead of corrected_text.",
             "Do not use MCP servers, shell tools, web tools, repository files, or network retrieval.",
             "Built-in image inspection for the attached file is allowed; do not mention tools in the final JSON.",
             "",
@@ -889,6 +891,8 @@ def qwen_peer_prompt(ocr_text: str, context: str = "") -> str:
         "Return exactly one JSON object: "
         "{\"verdict\":\"accept|revise|reject\",\"corrected_text\":\"...\",\"issues\":[\"...\"],\"confidence\":0.0}. "
         "Use accept when the OCR is good enough. Use revise only when you can correct visible errors. "
+        "Use revise only for compact local corrections; keep corrected_text under 2000 characters. "
+        "If the OCR has broad layout/table errors or would require full-page retranscription, use reject with issues instead of corrected_text. "
         "Use reject when the OCR is too incomplete or the image cannot be compared reliably. "
         "Do not invent text that is not visible. Do not add commentary, markdown fences, or apologies."
     )
