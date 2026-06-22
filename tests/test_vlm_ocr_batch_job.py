@@ -4,6 +4,8 @@ from pathlib import Path
 
 from scripts.run_vlm_ocr_batch_job import (
     cli_primary_ocr_page,
+    filter_completed_paths,
+    load_completed_item_paths,
     load_processed,
     parse_partition_spec,
     run_primary_ocr_page,
@@ -46,6 +48,33 @@ def test_load_processed_can_retry_failed_items(tmp_path):
         "ok.json": "updated",
         "ok2.json": "updated",
     }
+
+
+def test_filter_completed_paths_only_excludes_updated_results(tmp_path):
+    repo_root = tmp_path
+    output_root = tmp_path / "batch"
+    job_dir = output_root / "job"
+    job_dir.mkdir(parents=True)
+    updated = tmp_path / "artifacts" / "pety" / "metadata" / "items" / "updated.json"
+    empty = tmp_path / "artifacts" / "pety" / "metadata" / "items" / "empty.json"
+    pending = tmp_path / "artifacts" / "pety" / "metadata" / "items" / "pending.json"
+    for path in (updated, empty, pending):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    (job_dir / "results.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"item_path": str(updated), "status": "updated"}),
+                json.dumps({"item_path": str(empty), "status": "updated_empty"}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    completed = load_completed_item_paths([Path("batch")], repo_root)
+    assert str(updated.resolve()) in completed
+    assert str(empty.resolve()) not in completed
+    assert filter_completed_paths([updated, empty, pending], completed, repo_root) == [empty, pending]
 
 
 def test_weighted_partition_paths_splits_without_overlap():

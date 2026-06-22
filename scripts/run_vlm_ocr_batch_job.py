@@ -116,6 +116,40 @@ def load_processed(checkpoint_path: Path, results_path: Path, *, retry_failed: b
     return processed
 
 
+def item_path_key(item_path: str | Path, repo_root: Path) -> str:
+    path = Path(item_path)
+    return str(path.resolve() if path.is_absolute() else (repo_root / path).resolve())
+
+
+def load_completed_item_paths(output_roots: list[Path], repo_root: Path) -> set[str]:
+    completed: set[str] = set()
+    for output_root in output_roots:
+        root = output_root if output_root.is_absolute() else repo_root / output_root
+        root = root.resolve()
+        if not root.exists():
+            continue
+        for results_path in sorted(root.glob("*/results.jsonl")):
+            for line in results_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(record.get("status") or "") != "updated":
+                    continue
+                item_path = str(record.get("item_path") or "")
+                if item_path:
+                    completed.add(item_path_key(item_path, repo_root))
+    return completed
+
+
+def filter_completed_paths(paths: list[Path], completed: set[str], repo_root: Path) -> list[Path]:
+    if not completed:
+        return paths
+    return [path for path in paths if item_path_key(path, repo_root) not in completed]
+
+
 def parse_partition_spec(spec: str) -> list[tuple[str, float]]:
     partitions: list[tuple[str, float]] = []
     for raw_part in spec.split(","):
@@ -584,6 +618,8 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
 def selected_paths(args: argparse.Namespace, repo_root: Path) -> list[Path]:
     artifacts_root = (repo_root / args.artifacts_root).resolve()
     paths = iter_ocr_needed_items(artifacts_root, parse_sources(args.source))
+    exclude_roots = [Path(part) for part in csv_parts(getattr(args, "exclude_output_roots", ""))]
+    paths = filter_completed_paths(paths, load_completed_item_paths(exclude_roots, repo_root), repo_root)
     if args.limit is not None:
         paths = paths[: args.limit]
     return weighted_partition_paths(paths, args.partition_spec, args.partition_name)
@@ -670,6 +706,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", default="all")
     parser.add_argument("--artifacts-root", type=Path, default=Path("artifacts"))
     parser.add_argument("--output-root", type=Path, default=Path("artifacts/validation/ocr_batch_sharp11"))
+    parser.add_argument(
+        "--exclude-output-roots",
+        default="",
+        help="Comma-separated prior batch output roots whose updated items should be skipped before partitioning.",
+    )
     parser.add_argument(
         "--partition-spec",
         default="",
