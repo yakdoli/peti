@@ -311,6 +311,109 @@ def test_opencode_primary_backend(monkeypatch, tmp_path):
     assert seen["skip_permissions"] is True
 
 
+def test_claude_primary_backend(monkeypatch, tmp_path):
+    raw = tmp_path / "raw.png"
+    prepared = tmp_path / "prepared.png"
+    raw.write_bytes(b"raw")
+    prepared.write_bytes(b"prepared")
+    seen = {}
+
+    def fake_claude(image_path, *, model_id, timeout, max_side, context):
+        seen.update(
+            {
+                "image_path": image_path,
+                "model_id": model_id,
+                "timeout": timeout,
+                "max_side": max_side,
+                "context": context,
+            }
+        )
+        return {"engine": "claude_cli", "status": "ok", "text": "관보", "confidence": 0.9}
+
+    monkeypatch.setattr("scripts.run_vlm_ocr_batch_job.claude_ocr_page", fake_claude)
+
+    args = Namespace(
+        primary="claude_cli",
+        claude_model="sonnet",
+        claude_timeout=99,
+        max_side=3508,
+    )
+
+    result = run_primary_ocr_page(
+        raw,
+        prepared,
+        {"width": 100, "height": 200},
+        args=args,
+        page_number=1,
+        context="page=1",
+    )
+
+    assert result["engine"] == "claude_cli"
+    assert result["text"] == "관보"
+    assert seen["image_path"] == prepared
+    assert seen["model_id"] == "sonnet"
+    assert seen["timeout"] == 99
+    assert seen["max_side"] == 3508
+
+
+def test_agy_primary_falls_back_to_claude_by_default(monkeypatch, tmp_path):
+    raw = tmp_path / "raw.png"
+    prepared = tmp_path / "prepared.png"
+    raw.write_bytes(b"raw")
+    prepared.write_bytes(b"prepared")
+    seen = {}
+
+    def fake_cli_primary(*args, **kwargs):
+        return {"engine": "agy_cli", "status": "empty", "text": "", "confidence": 0.0}
+
+    def fake_claude(image_path, *, model_id, timeout, max_side, context):
+        seen.update(
+            {
+                "image_path": image_path,
+                "model_id": model_id,
+                "timeout": timeout,
+                "max_side": max_side,
+                "context": context,
+            }
+        )
+        return {"engine": "claude_cli", "status": "ok", "text": "관보", "confidence": 0.85}
+
+    monkeypatch.setattr("scripts.run_vlm_ocr_batch_job.cli_primary_ocr_page", fake_cli_primary)
+    monkeypatch.setattr("scripts.run_vlm_ocr_batch_job.claude_ocr_page", fake_claude)
+
+    args = Namespace(
+        primary="agy_cli",
+        primary_cli_timeout=30,
+        max_side=3508,
+        agy_agent_file=Path(".agy/agents/peti-ocr-primary.md"),
+        agy_skill_file=Path(".agy/skills/peti-korean-ocr-primary/SKILL.md"),
+        agy_model="",
+        agy_add_dir=None,
+        agy_dangerously_skip_permissions=True,
+        agy_fallback_backend="claude_cli",
+        claude_fallback_model="sonnet",
+        claude_fallback_timeout=66,
+    )
+
+    result = run_primary_ocr_page(
+        raw,
+        prepared,
+        {"width": 100, "height": 200},
+        args=args,
+        page_number=1,
+        context="page=1",
+    )
+
+    assert result["status"] == "ok"
+    assert result["engine"] == "claude_cli"
+    assert result["fallback_backend"] == "claude_cli"
+    assert result["fallback_reason"] == "empty"
+    assert result["fallback_from"]["engine"] == "agy_cli"
+    assert seen["image_path"] == prepared
+    assert seen["model_id"] == "sonnet"
+    assert seen["timeout"] == 66
+
+
 def test_cli_primary_ocr_page_supports_codex(monkeypatch, tmp_path):
     image = tmp_path / "page.png"
     image.write_bytes(b"fake")

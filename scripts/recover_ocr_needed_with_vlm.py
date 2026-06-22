@@ -31,6 +31,7 @@ SOURCE_NAMES = ("pety", "searchThema")
 DEFAULT_MODEL_ID = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 DEFAULT_OPENCODE_MODEL_ID = "zai-coding-plan/glm-5.2"
 DEFAULT_OPENCODE_AGENT_ID = "peti-ocr-primary"
+DEFAULT_CLAUDE_MODEL_ID = ""
 A4_250DPI_WIDTH = 2480
 A4_250DPI_HEIGHT = 3508
 QWEN_VL_250DPI_PREPROCESSOR = "qwen_vl_250dpi"
@@ -128,6 +129,8 @@ def recovery_scope(args: argparse.Namespace) -> str:
 def effective_model_id(args: argparse.Namespace) -> str:
     if args.ocr_backend == "opencode_cli":
         return str(args.opencode_model)
+    if args.ocr_backend == "claude_cli":
+        return str(args.claude_model or "claude_cli_default")
     return str(args.model_id)
 
 
@@ -140,6 +143,8 @@ def effective_agent_id(args: argparse.Namespace) -> str:
 def primary_backend_record_key(backend: str) -> str:
     if backend == "opencode_cli":
         return "opencode"
+    if backend == "claude_cli":
+        return "claude"
     if backend == "qwen_vllm":
         return "qwen"
     return "primary"
@@ -562,6 +567,72 @@ def opencode_ocr_page(
     return result
 
 
+def claude_ocr_page(
+    image_path: Path,
+    *,
+    model_id: str = DEFAULT_CLAUDE_MODEL_ID,
+    timeout: float,
+    max_side: int,
+    context: str = "",
+) -> dict[str, Any]:
+    attachment_path, cleanup_path = cli_attachment_image(image_path, max_side=max_side)
+    prompt = "\n".join(
+        [
+            ocr_prompt(context),
+            "",
+            f"Image path: {attachment_path.resolve()}",
+            f"![page]({attachment_path.resolve()})",
+        ]
+    )
+    command = [
+        "claude",
+        "-p",
+        prompt,
+        "--permission-mode",
+        "dontAsk",
+        "--add-dir",
+        str(attachment_path.parent),
+        "--safe-mode",
+        "--tools",
+        "Read",
+        "--no-session-persistence",
+    ]
+    if model_id:
+        command.extend(["--model", model_id])
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 15, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "engine": "claude_cli",
+            "model_id": model_id or "claude_cli_default",
+            "text": "",
+            "confidence": 0.0,
+            "notes": "",
+            "raw_response": "",
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        if cleanup_path is not None:
+            cleanup_path.unlink(missing_ok=True)
+    result = ocr_result_from_response(
+        completed.stdout,
+        engine="claude_cli",
+        model_id=model_id or "claude_cli_default",
+    )
+    result["tools"] = "Read"
+    if completed.returncode != 0:
+        result.update(
+            {
+                "status": "error",
+                "returncode": completed.returncode,
+                "stdout": completed.stdout[-2000:],
+                "stderr": completed.stderr[-2000:],
+            }
+        )
+    return result
+
+
 def run_primary_ocr_page(
     image_path: Path,
     *,
@@ -579,6 +650,14 @@ def run_primary_ocr_page(
             context=context,
             pure=args.opencode_pure,
             skip_permissions=args.opencode_skip_permissions,
+        )
+    if args.ocr_backend == "claude_cli":
+        return claude_ocr_page(
+            image_path,
+            model_id=args.claude_model,
+            timeout=args.claude_timeout,
+            max_side=args.max_side,
+            context=context,
         )
     return qwen_ocr_page(
         image_path,
@@ -627,6 +706,7 @@ def run_peer_cli(
     timeout: float,
     context: str = "",
     opencode_model: str = DEFAULT_OPENCODE_MODEL_ID,
+    claude_model: str = DEFAULT_CLAUDE_MODEL_ID,
 ) -> dict[str, Any]:
     prompt = peer_prompt(ocr_text, image_path, context=context)
     if peer == "agy":
@@ -682,7 +762,13 @@ def run_peer_cli(
             "dontAsk",
             "--add-dir",
             str(image_path.parent),
+            "--safe-mode",
+            "--tools",
+            "Read",
+            "--no-session-persistence",
         ]
+        if claude_model:
+            command.extend(["--model", claude_model])
     else:
         return {"status": "skipped", "error": f"unknown peer: {peer}"}
     try:
@@ -788,6 +874,7 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
                             timeout=args.peer_timeout,
                             context=context,
                             opencode_model=args.opencode_model,
+                            claude_model=args.claude_model,
                         )
                         for peer in peers
                         if primary_ocr.get("text")
@@ -894,11 +981,12 @@ def main() -> int:
     parser.add_argument("--source", default="all", help="all, pety, searchThema, or comma-separated sources")
     parser.add_argument("--artifacts-root", type=Path, default=Path("artifacts"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/validation"))
-    parser.add_argument("--ocr-backend", choices=("opencode_cli", "qwen_vllm"), default="opencode_cli")
+    parser.add_argument("--ocr-backend", choices=("opencode_cli", "claude_cli", "qwen_vllm"), default="opencode_cli")
     parser.add_argument("--endpoint-url", default="http://127.0.0.1:30000", help="qwen_vllm OpenAI-compatible endpoint")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="qwen_vllm model id")
     parser.add_argument("--opencode-model", default=DEFAULT_OPENCODE_MODEL_ID, help="opencode CLI model id")
     parser.add_argument("--opencode-agent", default=DEFAULT_OPENCODE_AGENT_ID, help="opencode primary OCR agent id")
+    parser.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL_ID, help="claude CLI model id; empty uses CLI default")
     parser.add_argument(
         "--opencode-pure",
         action=argparse.BooleanOptionalAction,
@@ -925,6 +1013,7 @@ def main() -> int:
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--qwen-timeout", type=float, default=420.0)
     parser.add_argument("--opencode-timeout", type=float, default=180.0)
+    parser.add_argument("--claude-timeout", type=float, default=360.0)
     parser.add_argument("--peer-timeout", type=float, default=300.0)
     parser.add_argument("--peers", default="agy,codex", help="comma-separated: agy,codex,claude; empty disables peers")
     parser.add_argument("--seed", type=int, default=17)
@@ -949,6 +1038,8 @@ def main() -> int:
         parser.error("--opencode-model must be non-empty for opencode_cli")
     if args.ocr_backend == "opencode_cli" and not args.opencode_agent.strip():
         parser.error("--opencode-agent must be non-empty for opencode_cli")
+    if args.ocr_backend == "claude_cli" and args.claude_timeout <= 0:
+        parser.error("--claude-timeout must be positive for claude_cli")
     if args.dpi < 250:
         print(
             f"warning: dpi={args.dpi} is below A4 250dpi recovery target; use --dpi 250 for target coverage",

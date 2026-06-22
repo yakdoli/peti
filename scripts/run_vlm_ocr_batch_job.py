@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     A4_250DPI_HEIGHT,
+    DEFAULT_CLAUDE_MODEL_ID,
     DEFAULT_MODEL_ID,
     DEFAULT_OPENCODE_AGENT_ID,
     DEFAULT_OPENCODE_MODEL_ID,
@@ -38,6 +39,7 @@ from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     normalize_text,
     ocr_prompt,
     ocr_result_from_response,
+    claude_ocr_page,
     opencode_ocr_page,
     page_image_context,
     page_ocr_images,
@@ -51,8 +53,8 @@ from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     write_json,
 )
 
-PRIMARY_BACKENDS = ("qwen_vllm", "agy_cli", "opencode_cli", "codex_cli")
-AGY_FALLBACK_BACKENDS = ("none", "opencode_cli")
+PRIMARY_BACKENDS = ("qwen_vllm", "agy_cli", "opencode_cli", "claude_cli", "codex_cli")
+AGY_FALLBACK_BACKENDS = ("none", "opencode_cli", "claude_cli")
 DEFAULT_AGY_AGENT_FILE = Path(".agy/agents/peti-ocr-primary.md")
 DEFAULT_AGY_SKILL_FILE = Path(".agy/skills/peti-korean-ocr-primary/SKILL.md")
 
@@ -330,6 +332,14 @@ def run_primary_ocr_page(
             pure=args.opencode_pure,
             skip_permissions=args.opencode_skip_permissions,
         )
+    if args.primary == "claude_cli":
+        return claude_ocr_page(
+            prepared_page_image,
+            model_id=args.claude_model,
+            timeout=args.claude_timeout,
+            max_side=args.max_side,
+            context=context,
+        )
     primary = cli_primary_ocr_page(
         prepared_page_image,
         backend=args.primary,
@@ -344,21 +354,30 @@ def run_primary_ocr_page(
     )
     if (
         args.primary == "agy_cli"
-        and args.agy_fallback_backend == "opencode_cli"
+        and args.agy_fallback_backend in {"opencode_cli", "claude_cli"}
         and primary.get("status") in {"empty", "error"}
     ):
         started = time.perf_counter()
-        fallback = opencode_ocr_page(
-            prepared_page_image,
-            model_id=args.opencode_fallback_model,
-            agent_id=args.opencode_fallback_agent,
-            timeout=args.opencode_fallback_timeout,
-            max_side=args.max_side,
-            context=f"{context}, fallback_from=agy_cli",
-            pure=args.opencode_pure,
-            skip_permissions=args.opencode_skip_permissions,
-        )
-        fallback["fallback_backend"] = "opencode_cli"
+        if args.agy_fallback_backend == "claude_cli":
+            fallback = claude_ocr_page(
+                prepared_page_image,
+                model_id=args.claude_fallback_model,
+                timeout=args.claude_fallback_timeout,
+                max_side=args.max_side,
+                context=f"{context}, fallback_from=agy_cli",
+            )
+        else:
+            fallback = opencode_ocr_page(
+                prepared_page_image,
+                model_id=args.opencode_fallback_model,
+                agent_id=args.opencode_fallback_agent,
+                timeout=args.opencode_fallback_timeout,
+                max_side=args.max_side,
+                context=f"{context}, fallback_from=agy_cli",
+                pure=args.opencode_pure,
+                skip_permissions=args.opencode_skip_permissions,
+            )
+        fallback["fallback_backend"] = args.agy_fallback_backend
         fallback["fallback_reason"] = str(primary.get("status") or "unknown")
         fallback["fallback_from"] = primary
         fallback["fallback_duration_s"] = time.perf_counter() - started
@@ -424,6 +443,7 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
                             timeout=args.peer_timeout,
                             context=context,
                             opencode_model=args.opencode_model,
+                            claude_model=args.claude_model,
                         )
                         for peer in peers
                         if primary_ocr.get("text")
@@ -635,7 +655,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agy-model", default="")
     parser.add_argument("--agy-add-dir", type=Path)
     parser.add_argument("--agy-dangerously-skip-permissions", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--agy-fallback-backend", choices=AGY_FALLBACK_BACKENDS, default="opencode_cli")
+    parser.add_argument("--agy-fallback-backend", choices=AGY_FALLBACK_BACKENDS, default="claude_cli")
     parser.add_argument("--opencode-model", default=DEFAULT_OPENCODE_MODEL_ID)
     parser.add_argument("--opencode-agent", default=DEFAULT_OPENCODE_AGENT_ID)
     parser.add_argument("--opencode-timeout", type=float, default=240.0)
@@ -654,6 +674,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opencode-fallback-model", default=DEFAULT_OPENCODE_MODEL_ID)
     parser.add_argument("--opencode-fallback-agent", default=DEFAULT_OPENCODE_AGENT_ID)
     parser.add_argument("--opencode-fallback-timeout", type=float, default=240.0)
+    parser.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL_ID)
+    parser.add_argument("--claude-timeout", type=float, default=360.0)
+    parser.add_argument("--claude-fallback-model", default=DEFAULT_CLAUDE_MODEL_ID)
+    parser.add_argument("--claude-fallback-timeout", type=float, default=360.0)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--progress-every", type=int, default=1)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)

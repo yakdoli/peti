@@ -10,6 +10,7 @@ from scripts.recover_ocr_needed_with_vlm import (
     QWEN_VL_250DPI_GRAY_PREPROCESSOR,
     QWEN_VL_250DPI_PREPROCESSOR,
     QWEN_VL_250DPI_SHARP_PREPROCESSOR,
+    claude_ocr_page,
     choose_final_text,
     extract_json_object,
     opencode_ocr_page,
@@ -243,6 +244,38 @@ def test_opencode_ocr_page_downscales_file_attachment(monkeypatch, tmp_path):
     assert not Path(seen["attachment"]).exists()
 
 
+def test_claude_ocr_page_uses_read_only_image_access(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"text":"관보","confidence":0.88,"notes":"ok"}'
+        stderr = ""
+
+    def fake_run(command, capture_output, text, timeout, check):
+        seen["command"] = command
+        seen["timeout"] = timeout
+        return Completed()
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.subprocess.run", fake_run)
+
+    result = claude_ocr_page(page, model_id="sonnet", timeout=20, max_side=100, context="page=1")
+
+    assert result["status"] == "ok"
+    assert result["engine"] == "claude_cli"
+    assert result["model_id"] == "sonnet"
+    assert result["text"] == "관보"
+    assert seen["command"][:2] == ["claude", "-p"]
+    assert "--permission-mode" in seen["command"]
+    assert "--safe-mode" in seen["command"]
+    assert seen["command"][seen["command"].index("--tools") + 1] == "Read"
+    assert seen["command"][seen["command"].index("--model") + 1] == "sonnet"
+    assert f"![page]({page.resolve()})" in seen["command"][2]
+    assert seen["timeout"] == 35
+
+
 def test_run_peer_cli_supports_vibe_agent(monkeypatch, tmp_path):
     page = tmp_path / "page.png"
     Image.new("RGB", (100, 100), "white").save(page)
@@ -268,6 +301,35 @@ def test_run_peer_cli_supports_vibe_agent(monkeypatch, tmp_path):
     assert seen["command"][3:5] == ["--agent", "peti-ocr-peer"]
     assert f"@{page.resolve()}" in seen["command"][2]
     assert "--add-dir" in seen["command"]
+    assert seen["timeout"] == 35
+
+
+def test_run_peer_cli_supports_claude_agent(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"verdict":"accept","corrected_text":"","issues":[],"confidence":0.92}'
+        stderr = ""
+
+    def fake_run(command, capture_output, text, timeout, check):
+        seen["command"] = command
+        seen["timeout"] = timeout
+        return Completed()
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.subprocess.run", fake_run)
+
+    result = run_peer_cli("claude", page, "primary text", timeout=20, context="page=1", claude_model="sonnet")
+
+    assert result["status"] == "ok"
+    assert result["verdict"] == "accept"
+    assert seen["command"][:2] == ["claude", "-p"]
+    assert "--safe-mode" in seen["command"]
+    assert seen["command"][seen["command"].index("--tools") + 1] == "Read"
+    assert seen["command"][seen["command"].index("--model") + 1] == "sonnet"
+    assert "Primary OCR text:" in seen["command"][2]
     assert seen["timeout"] == 35
 
 
