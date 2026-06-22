@@ -150,6 +150,40 @@ def filter_completed_paths(paths: list[Path], completed: set[str], repo_root: Pa
     return [path for path in paths if item_path_key(path, repo_root) not in completed]
 
 
+def positive_int_values(value: Any) -> list[int]:
+    if isinstance(value, list):
+        candidates = value
+    elif isinstance(value, str):
+        candidates = [part.strip() for part in value.split(",")]
+    else:
+        candidates = []
+
+    pages: list[int] = []
+    seen: set[int] = set()
+    for candidate in candidates:
+        try:
+            page = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if page <= 0 or page in seen:
+            continue
+        pages.append(page)
+        seen.add(page)
+    return pages
+
+
+def ocr_page_numbers_for_item(item: dict[str, Any], max_pages: int) -> list[int]:
+    pdf = item.get("pdf") if isinstance(item.get("pdf"), dict) else {}
+    target_pages = positive_int_values((pdf or {}).get("ocr_target_pages"))
+    if target_pages:
+        return target_pages[:max_pages]
+
+    pdf_text = item.get("pdf_text") if isinstance(item.get("pdf_text"), dict) else {}
+    pages_total = int(pdf_text.get("pages") or 0)
+    pages_to_process = min(max_pages, pages_total) if pages_total > 0 else max_pages
+    return list(range(1, pages_to_process + 1))
+
+
 def parse_partition_spec(spec: str) -> list[tuple[str, float]]:
     partitions: list[tuple[str, float]] = []
     for raw_part in spec.split(","):
@@ -469,14 +503,14 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
         return {**result, "status": "missing_pdf_path"}
     pdf_path = resolve_path(pdf_path_text, repo_root)
     pages_total = int(pdf_text.get("pages") or 0)
-    pages_to_process = min(args.max_pages, pages_total) if pages_total > 0 else args.max_pages
+    page_numbers = ocr_page_numbers_for_item(item, args.max_pages)
     peers = csv_parts(args.peers)
     qwen_peer_models = parse_qwen_peer_models(args.qwen_peer_models, api_profile=qwen_peer_api_profile(args))
     recovery_pages: list[dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix=f"peti-{args.job_name}-") as temp:
         temp_dir = Path(temp)
-        for page_number in range(1, pages_to_process + 1):
+        for page_number in page_numbers:
             page_record: dict[str, Any] = {"page": page_number, "status": "unknown"}
             try:
                 page_image = render_pdf_page(pdf_path, page_number, temp_dir, dpi=args.dpi)
@@ -560,6 +594,7 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
         "endpoint_url": args.endpoint_url if args.primary == "qwen_vllm" else "",
         "pages_total": pages_total,
         "pages_processed": len(recovery_pages),
+        "page_numbers": page_numbers,
         "rendering": {
             "dpi": args.dpi,
             "page_ocr_mode": "single_page",
@@ -632,9 +667,7 @@ def scheduled_pages_for_item(path: Path, max_pages: int) -> int:
         return max_pages
     if not isinstance(item, dict):
         return max_pages
-    pdf_text = item.get("pdf_text") if isinstance(item.get("pdf_text"), dict) else {}
-    pages_total = int(pdf_text.get("pages") or 0)
-    return min(max_pages, pages_total) if pages_total > 0 else max_pages
+    return len(ocr_page_numbers_for_item(item, max_pages))
 
 
 def total_scheduled_pages(paths: list[Path], max_pages: int) -> int:

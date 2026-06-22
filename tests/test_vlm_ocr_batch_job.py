@@ -7,8 +7,10 @@ from scripts.run_vlm_ocr_batch_job import (
     filter_completed_paths,
     load_completed_item_paths,
     load_processed,
+    ocr_page_numbers_for_item,
     parse_partition_spec,
     run_primary_ocr_page,
+    scheduled_pages_for_item,
     weighted_partition_paths,
 )
 from scripts.subagent_ocr_queue import build_page_tasks, pages_to_schedule, status_payload, task_key
@@ -75,6 +77,25 @@ def test_filter_completed_paths_only_excludes_updated_results(tmp_path):
     assert str(updated.resolve()) in completed
     assert str(empty.resolve()) not in completed
     assert filter_completed_paths([updated, empty, pending], completed, repo_root) == [empty, pending]
+
+
+def test_ocr_page_numbers_prefers_metadata_target_pages(tmp_path):
+    item = {
+        "pdf": {"ocr_target_pages": ["187", 187, "bad", 0, 188]},
+        "pdf_text": {"pages": 206},
+    }
+
+    assert ocr_page_numbers_for_item(item, max_pages=1) == [187]
+    assert ocr_page_numbers_for_item(item, max_pages=3) == [187, 188]
+
+    item_path = tmp_path / "item.json"
+    item_path.write_text(json.dumps(item), encoding="utf-8")
+    assert scheduled_pages_for_item(item_path, max_pages=3) == 2
+
+
+def test_ocr_page_numbers_falls_back_to_first_pages():
+    assert ocr_page_numbers_for_item({"pdf_text": {"pages": 3}}, max_pages=2) == [1, 2]
+    assert ocr_page_numbers_for_item({"pdf_text": {"pages": 0}}, max_pages=2) == [1, 2]
 
 
 def test_weighted_partition_paths_splits_without_overlap():
