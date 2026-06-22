@@ -22,14 +22,21 @@ if str(ROOT) not in sys.path:
 
 from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     A4_250DPI_HEIGHT,
+    DEFAULT_QWEN_MIN_P,
+    DEFAULT_QWEN_PRESENCE_PENALTY,
+    DEFAULT_QWEN_TEMPERATURE,
+    DEFAULT_QWEN_TOP_K,
+    DEFAULT_QWEN_TOP_P,
     DEFAULT_MODEL_ID,
+    IMAGE_PREPROCESSORS,
+    QWEN_VL_250DPI_PREPROCESSOR,
     extract_json_object,
-    image_data_url,
     image_size,
     iter_ocr_needed_items,
     jsonable,
     normalize_text,
     parse_sources,
+    prepared_image_data_url,
     render_pdf_page,
     resolve_path,
     write_json,
@@ -45,6 +52,7 @@ class BenchPage:
     image_path: Path
     width: int
     height: int
+    input_image: dict[str, Any]
     render_sec: float
     encode_sec: float
     image_url: str
@@ -65,6 +73,74 @@ def parse_csv_ints(value: str) -> list[int]:
     return values
 
 
+def compact_for_distance(text: str) -> str:
+    return "".join(normalize_text(text).split())
+
+
+def levenshtein_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    if len(left) < len(right):
+        left, right = right, left
+    previous = list(range(len(right) + 1))
+    for index, left_char in enumerate(left, start=1):
+        current = [index]
+        for offset, right_char in enumerate(right, start=1):
+            insert_cost = current[offset - 1] + 1
+            delete_cost = previous[offset] + 1
+            replace_cost = previous[offset - 1] + (left_char != right_char)
+            current.append(min(insert_cost, delete_cost, replace_cost))
+        previous = current
+    return previous[-1]
+
+
+def reference_metrics(text: str, reference_text: str) -> dict[str, Any]:
+    reference = compact_for_distance(reference_text)
+    candidate = compact_for_distance(text)
+    distance = levenshtein_distance(reference, candidate)
+    reference_chars = len(reference)
+    candidate_chars = len(candidate)
+    cer = distance / max(1, reference_chars)
+    return {
+        "reference_chars": reference_chars,
+        "candidate_chars": candidate_chars,
+        "distance": distance,
+        "cer": round(cer, 6),
+        "similarity": round(max(0.0, 1.0 - cer), 6),
+        "length_ratio": round(candidate_chars / max(1, reference_chars), 4),
+    }
+
+
+def value_at_path(data: Any, path: tuple[str, ...]) -> Any:
+    current = data
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def load_reference_text(path: Path) -> str:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    candidates = [
+        ("peers", "agy_cli", "corrected_text"),
+        ("consensus", "corrected_text"),
+        ("ocr", "text"),
+        ("primary_text",),
+        ("corrected_text",),
+        ("text",),
+    ]
+    for candidate_path in candidates:
+        value = value_at_path(data, candidate_path)
+        if isinstance(value, str) and value.strip():
+            return normalize_text(value)
+    raise ValueError(f"no reference text field found in {path}")
+
+
 def source_from_path(path: Path) -> str:
     parts = path.parts
     if "searchThema" in parts:
@@ -82,6 +158,23 @@ def load_item(path: Path) -> dict[str, Any]:
 
 
 def select_items(args: argparse.Namespace, repo_root: Path) -> list[tuple[Path, Path, int]]:
+    if args.item_path:
+        item_path = Path(args.item_path)
+        if not item_path.is_absolute():
+            item_path = repo_root / item_path
+        item = load_item(item_path)
+        pdf = item.get("pdf") if isinstance(item.get("pdf"), dict) else {}
+        pdf_path_text = str(pdf.get("path") or "").strip()
+        if not pdf_path_text:
+            raise SystemExit(f"item has no pdf.path: {item_path}")
+        pdf_path = resolve_path(pdf_path_text, repo_root)
+        if not pdf_path.exists():
+            raise SystemExit(f"PDF does not exist: {pdf_path}")
+        pdf_text = item.get("pdf_text") if isinstance(item.get("pdf_text"), dict) else {}
+        pages_total = int(pdf_text.get("pages") or 0)
+        pages_to_process = min(args.max_pages, pages_total) if pages_total > 0 else args.max_pages
+        return [(item_path, pdf_path, pages_to_process)]
+
     artifacts_root = (repo_root / args.artifacts_root).resolve()
     candidates = iter_ocr_needed_items(artifacts_root, parse_sources(args.source))
     selected: list[tuple[Path, Path, int]] = []
@@ -120,7 +213,12 @@ def prepare_pages(args: argparse.Namespace, repo_root: Path, work_dir: Path) -> 
             render_sec = time.perf_counter() - started
             width, height = image_size(image_path)
             started = time.perf_counter()
-            data_url = image_data_url(image_path, max_side=args.max_side)
+            data_url, input_image = prepared_image_data_url(
+                image_path,
+                max_side=args.max_side,
+                preprocess=args.image_preprocess,
+                upscale=args.image_upscale,
+            )
             encode_sec = time.perf_counter() - started
             pages.append(
                 BenchPage(
@@ -131,6 +229,7 @@ def prepare_pages(args: argparse.Namespace, repo_root: Path, work_dir: Path) -> 
                     image_path=image_path,
                     width=width,
                     height=height,
+                    input_image=input_image,
                     render_sec=render_sec,
                     encode_sec=encode_sec,
                     image_url=data_url,
@@ -150,6 +249,7 @@ def prompt_for_page(page: BenchPage, dpi: int) -> str:
         "Do not infer text that is not visible. Return exactly one JSON object with this schema: "
         f"{schema}. Do not add commentary.\n\n"
         f"Image context: page={page.page}, dpi={dpi}, page_pixels={page.width}x{page.height}, "
+        f"input_pixels={page.input_image.get('width')}x{page.input_image.get('height')}, "
         f"bbox=0,0,{page.width},{page.height}. This is a full-page A4 250dpi-capable render."
     )
 
@@ -168,9 +268,12 @@ def build_payload(page: BenchPage, args: argparse.Namespace) -> dict[str, Any]:
         ],
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "presence_penalty": args.presence_penalty,
         "max_tokens": args.max_tokens,
         "seed": args.seed + page.page,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
     }
 
 
@@ -234,7 +337,7 @@ def text_quality_metrics(text: str) -> dict[str, Any]:
     }
 
 
-def run_one(page: BenchPage, args: argparse.Namespace, concurrency: int) -> dict[str, Any]:
+def run_one(page: BenchPage, args: argparse.Namespace, concurrency: int, reference_text: str) -> dict[str, Any]:
     url = f"{args.endpoint_url.rstrip('/')}/v1/chat/completions"
     payload = build_payload(page, args)
     started = time.perf_counter()
@@ -252,6 +355,7 @@ def run_one(page: BenchPage, args: argparse.Namespace, concurrency: int) -> dict
         return {
             "status": "ok" if text else "empty",
             "error": "",
+            "variant": args.variant_name,
             "source": page.source,
             "item_path": str(page.item_path),
             "pdf_path": str(page.pdf_path),
@@ -259,14 +363,18 @@ def run_one(page: BenchPage, args: argparse.Namespace, concurrency: int) -> dict
             "image_path": str(page.image_path),
             "image_width": page.width,
             "image_height": page.height,
+            "input_image": page.input_image,
             "render_sec": round(page.render_sec, 3),
             "encode_sec": round(page.encode_sec, 3),
             "concurrency": concurrency,
             "latency_sec": round(latency_sec, 3),
             "parse_ok": bool(parsed),
             "confidence": max(0.0, min(1.0, confidence_value)),
+            "usage": response.get("usage", {}) if isinstance(response, dict) else {},
+            "timings": response.get("timings", {}) if isinstance(response, dict) else {},
             "notes": str(parsed.get("notes", "")).strip()[:500] if parsed else "",
             "quality": text_quality_metrics(text),
+            "reference": reference_metrics(text, reference_text) if reference_text else {},
             "sample_text": text[: args.sample_chars],
             "raw_tail": raw[-1000:] if args.include_raw else "",
         }
@@ -274,6 +382,7 @@ def run_one(page: BenchPage, args: argparse.Namespace, concurrency: int) -> dict
         return {
             "status": "error",
             "error": f"{type(exc).__name__}: {exc}",
+            "variant": args.variant_name,
             "source": page.source,
             "item_path": str(page.item_path),
             "pdf_path": str(page.pdf_path),
@@ -281,13 +390,17 @@ def run_one(page: BenchPage, args: argparse.Namespace, concurrency: int) -> dict
             "image_path": str(page.image_path),
             "image_width": page.width,
             "image_height": page.height,
+            "input_image": page.input_image,
             "render_sec": round(page.render_sec, 3),
             "encode_sec": round(page.encode_sec, 3),
             "concurrency": concurrency,
             "latency_sec": round(time.perf_counter() - started, 3),
             "parse_ok": False,
             "confidence": 0.0,
+            "usage": {},
+            "timings": {},
             "quality": text_quality_metrics(""),
+            "reference": reference_metrics("", reference_text) if reference_text else {},
             "sample_text": "",
             "raw_tail": "",
         }
@@ -307,6 +420,16 @@ def summarize(records: list[dict[str, Any]], elapsed_sec: float) -> dict[str, An
     chars = [int(record.get("quality", {}).get("chars") or 0) for record in ok_records]
     hangul_ratios = [float(record.get("quality", {}).get("hangul_ratio") or 0.0) for record in ok_records]
     confidences = [float(record.get("confidence") or 0.0) for record in ok_records]
+    cers = [
+        float(record.get("reference", {}).get("cer") or 0.0)
+        for record in ok_records
+        if record.get("reference")
+    ]
+    similarities = [
+        float(record.get("reference", {}).get("similarity") or 0.0)
+        for record in ok_records
+        if record.get("reference")
+    ]
     return {
         "requests": len(records),
         "ok": len(ok_records),
@@ -322,14 +445,21 @@ def summarize(records: list[dict[str, Any]], elapsed_sec: float) -> dict[str, An
         "chars_avg": round(statistics.fmean(chars), 1) if chars else 0.0,
         "confidence_avg": round(statistics.fmean(confidences), 3) if confidences else 0.0,
         "hangul_ratio_avg": round(statistics.fmean(hangul_ratios), 4) if hangul_ratios else 0.0,
+        "cer_avg": round(statistics.fmean(cers), 6) if cers else None,
+        "similarity_avg": round(statistics.fmean(similarities), 6) if similarities else None,
     }
 
 
-def run_concurrency(pages: list[BenchPage], args: argparse.Namespace, concurrency: int) -> dict[str, Any]:
+def run_concurrency(
+    pages: list[BenchPage],
+    args: argparse.Namespace,
+    concurrency: int,
+    reference_text: str,
+) -> dict[str, Any]:
     started = time.perf_counter()
     records: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(run_one, page, args, concurrency) for page in pages]
+        futures = [executor.submit(run_one, page, args, concurrency, reference_text) for page in pages]
         for future in as_completed(futures):
             records.append(future.result())
     elapsed_sec = time.perf_counter() - started
@@ -349,15 +479,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", type=Path, default=None)
     parser.add_argument("--endpoint-url", default="http://127.0.0.1:30000")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--variant-name", default="", help="label recorded in each benchmark row")
+    parser.add_argument("--item-path", type=Path, default=None, help="benchmark one exact metadata item JSON")
+    parser.add_argument("--reference-json", type=Path, default=None, help="peer/baseline JSON containing reference text")
     parser.add_argument("--limit", type=int, default=2, help="number of OCR-needed PDF items to sample")
     parser.add_argument("--total-pages", type=int, default=None, help="cap prepared pages across all items")
     parser.add_argument("--max-pages", type=int, default=1)
     parser.add_argument("--dpi", type=int, default=250)
     parser.add_argument("--max-side", type=int, default=A4_250DPI_HEIGHT)
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--image-preprocess", choices=IMAGE_PREPROCESSORS, default=QWEN_VL_250DPI_PREPROCESSOR)
+    parser.add_argument("--image-upscale", type=float, default=1.0)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--timeout", type=float, default=420.0)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_QWEN_TEMPERATURE)
+    parser.add_argument("--top-p", type=float, default=DEFAULT_QWEN_TOP_P)
+    parser.add_argument("--top-k", type=int, default=DEFAULT_QWEN_TOP_K)
+    parser.add_argument("--min-p", type=float, default=DEFAULT_QWEN_MIN_P)
+    parser.add_argument("--presence-penalty", type=float, default=DEFAULT_QWEN_PRESENCE_PENALTY)
+    parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--concurrency-values", type=parse_csv_ints, default=[1])
     parser.add_argument("--sample-chars", type=int, default=1200)
@@ -373,6 +512,18 @@ def main() -> int:
         raise SystemExit("--limit must be positive")
     if args.total_pages is not None and args.total_pages <= 0:
         raise SystemExit("--total-pages must be positive")
+    if args.max_side <= 0:
+        raise SystemExit("--max-side must be positive")
+    if args.image_upscale <= 0:
+        raise SystemExit("--image-upscale must be positive")
+    if args.temperature < 0:
+        raise SystemExit("--temperature must be non-negative")
+    if not 0.0 < args.top_p <= 1.0:
+        raise SystemExit("--top-p must be in (0, 1]")
+    if args.top_k < 0:
+        raise SystemExit("--top-k must be non-negative")
+    if not 0.0 <= args.min_p <= 1.0:
+        raise SystemExit("--min-p must be in [0, 1]")
 
     repo_root = Path.cwd().resolve()
     output_dir = (repo_root / args.output_dir).resolve()
@@ -385,6 +536,11 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"VLM endpoint health check failed: {args.endpoint_url}: {exc}") from exc
 
+    reference_text = ""
+    if args.reference_json:
+        reference_path = args.reference_json if args.reference_json.is_absolute() else repo_root / args.reference_json
+        reference_text = load_reference_text(reference_path)
+
     prepared_started = time.perf_counter()
     pages = prepare_pages(args, repo_root, work_dir)
     prepare_sec = time.perf_counter() - prepared_started
@@ -394,12 +550,17 @@ def main() -> int:
     runs = []
     for concurrency in args.concurrency_values:
         print(f"benchmark concurrency={concurrency} pages={len(pages)}", flush=True)
-        runs.append(run_concurrency(pages, args, concurrency))
+        runs.append(run_concurrency(pages, args, concurrency, reference_text))
 
     report = {
         "created_at": iso_now(),
         "settings": jsonable(vars(args)),
         "endpoint_models": models,
+        "reference": {
+            "path": str(args.reference_json) if args.reference_json else "",
+            "chars": len(reference_text),
+            "compact_chars": len(compact_for_distance(reference_text)) if reference_text else 0,
+        },
         "prepared_pages": len(pages),
         "prepare_sec": round(prepare_sec, 3),
         "work_dir": str(work_dir),

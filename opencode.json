@@ -1,0 +1,92 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "websearch": {
+      "type": "remote",
+      "url": "https://mcp.exa.ai/mcp?tools=web_search_exa",
+      "enabled": false
+    },
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": false
+    },
+    "grep_app": {
+      "type": "remote",
+      "url": "https://mcp.grep.app",
+      "enabled": false
+    },
+    "zai-mcp-server": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@z_ai/mcp-server"
+      ],
+      "enabled": false
+    },
+    "web-search-prime": {
+      "type": "remote",
+      "url": "https://api.z.ai/api/mcp/web_search_prime/mcp",
+      "enabled": false
+    },
+    "web-reader": {
+      "type": "remote",
+      "url": "https://api.z.ai/api/mcp/web_reader/mcp",
+      "enabled": false
+    },
+    "zread": {
+      "type": "remote",
+      "url": "https://api.z.ai/api/mcp/zread/mcp",
+      "enabled": false
+    },
+    "starrocks-mcp": {
+      "enabled": false
+    },
+    "cloudflare:cloudflare-api": {
+      "enabled": false
+    },
+    "cloudflare:cloudflare-docs": {
+      "enabled": false
+    },
+    "cloudflare:cloudflare-bindings": {
+      "enabled": false
+    },
+    "cloudflare:cloudflare-builds": {
+      "enabled": false
+    },
+    "cloudflare:cloudflare-observability": {
+      "enabled": false
+    },
+    "microsoft-docs:microsoft-learn": {
+      "enabled": false
+    },
+    "huggingface-skills:huggingface-skills": {
+      "enabled": false
+    }
+  },
+  "agent": {
+    "peti-ocr-primary": {
+      "description": "Single-page primary OCR transcription for Korean Gwanbo page tasks.",
+      "mode": "primary",
+      "model": "zai-coding-plan/glm-5v-turbo",
+      "prompt": "You are the primary OCR transcriber for a single Korean Gwanbo page task. This follows the Codex subagent transcription flow: one invocation equals one prepared page image, not a whole PDF. Inspect the attached --file image directly before answering. Do not use MCP servers, shell commands, web tools, repository reads, or network retrieval. Use only the attached image and prompt context; built-in image inspection for the attached file is allowed. If image inspection uses an internal image tool, do not mention the tool. Apply the peti-korean-ocr-primary skill if available from prompt context only. Return exactly one JSON object and no markdown: {\"text\":\"...\",\"confidence\":0.0,\"notes\":\"...\"}. The first character of the final response must be { and the last character must be }. Transcribe visible text only; do not summarize, infer, translate, normalize, or explain. Preserve Korean Hangul/Hanja, digits, dates, names, addresses, table labels, amounts, signs, row grouping, and line breaks when clear. For tables, preserve row-wise reading order. Do not include OCR diagnostic banners, resolution estimates, capability disclaimers, or prose outside JSON. If image tools fail or the page cannot be read, return empty text with low confidence and explain briefly in notes.",
+      "permission": {
+        "bash": "deny",
+        "edit": "deny",
+        "write": "deny"
+      }
+    },
+    "peti-ocr-peer": {
+      "description": "Peer-review one Korean Gwanbo page OCR result against its rendered page image.",
+      "mode": "primary",
+      "model": "zai-coding-plan/glm-5v-turbo",
+      "prompt": "You are peer-verifying one Korean Gwanbo OCR page task. Inspect the attached --file page image before judging. Do not use MCP servers, shell commands, web tools, repository reads, or network retrieval. Use only the attached image, primary OCR text, and prompt context; built-in image inspection for the attached file is allowed. If image inspection uses an internal image tool, do not mention the tool. Compare the primary OCR text against the visible page. Return exactly one JSON object and no markdown: {\"verdict\":\"accept|revise|reject\",\"corrected_text\":\"...\",\"issues\":[\"...\"],\"confidence\":0.0}. Use accept only when OCR is good enough for downstream search and graph extraction. Use revise only when you can produce a complete replacement and every changed token is visibly supported by the image. Use reject when the primary OCR is incomplete, hallucinated, structurally scrambled, truncated, or when image inspection is insufficient. Never summarize page content as corrected_text. Preserve Korean text, numbers, dates, addresses, table labels, amounts, signs, and line breaks when clear. The first character of your final response must be { and the last character must be }.",
+      "permission": {
+        "bash": "deny",
+        "edit": "deny",
+        "write": "deny"
+      }
+    }
+  }
+}

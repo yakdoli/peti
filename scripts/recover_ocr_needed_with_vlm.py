@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -26,10 +28,29 @@ from src.metadata_schema import apply_item_schema
 
 
 SOURCE_NAMES = ("pety", "searchThema")
-DEFAULT_MODEL_ID = "olberdingbrands/Qwen3.6-35B-A3B-AWQ"
-DEFAULT_OPENCODE_MODEL_ID = "opencode/nemotron-3-ultra-free"
+DEFAULT_MODEL_ID = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+DEFAULT_OPENCODE_MODEL_ID = "zai-coding-plan/glm-5v-turbo"
+DEFAULT_OPENCODE_AGENT_ID = "peti-ocr-primary"
 A4_250DPI_WIDTH = 2480
 A4_250DPI_HEIGHT = 3508
+QWEN_VL_250DPI_PREPROCESSOR = "qwen_vl_250dpi"
+QWEN_VL_250DPI_GRAY_PREPROCESSOR = "qwen_vl_250dpi_gray"
+QWEN_VL_250DPI_LIGHT_PREPROCESSOR = "qwen_vl_250dpi_light"
+QWEN_VL_250DPI_SHARP_PREPROCESSOR = "qwen_vl_250dpi_sharp"
+QWEN_VL_250DPI_BINARIZE_PREPROCESSOR = "qwen_vl_250dpi_binarize"
+IMAGE_PREPROCESSORS = (
+    "none",
+    QWEN_VL_250DPI_PREPROCESSOR,
+    QWEN_VL_250DPI_GRAY_PREPROCESSOR,
+    QWEN_VL_250DPI_LIGHT_PREPROCESSOR,
+    QWEN_VL_250DPI_SHARP_PREPROCESSOR,
+    QWEN_VL_250DPI_BINARIZE_PREPROCESSOR,
+)
+DEFAULT_QWEN_TEMPERATURE = 0.2
+DEFAULT_QWEN_TOP_P = 0.8
+DEFAULT_QWEN_TOP_K = 20
+DEFAULT_QWEN_MIN_P = 0.0
+DEFAULT_QWEN_PRESENCE_PENALTY = 1.5
 
 
 def iso_now() -> str:
@@ -89,13 +110,39 @@ def resolve_path(path_text: str, repo_root: Path) -> Path:
 
 
 def recovery_scope(args: argparse.Namespace) -> str:
-    return f"first_{args.max_pages}_pages_{args.dpi}dpi_single_page_maxside{args.max_side}"
+    scope = f"first_{args.max_pages}_pages_{args.dpi}dpi_single_page_maxside{args.max_side}"
+    if getattr(args, "ocr_backend", "") == "qwen_vllm":
+        scope = (
+            f"{scope}_preprocess{getattr(args, 'image_preprocess', 'none')}"
+            f"_up{float(getattr(args, 'image_upscale', 1.0)):g}"
+            f"_temp{float(getattr(args, 'temperature', DEFAULT_QWEN_TEMPERATURE)):g}"
+            f"_tp{float(getattr(args, 'top_p', DEFAULT_QWEN_TOP_P)):g}"
+            f"_tk{int(getattr(args, 'top_k', DEFAULT_QWEN_TOP_K))}"
+            f"_mp{float(getattr(args, 'min_p', DEFAULT_QWEN_MIN_P)):g}"
+            f"_pp{float(getattr(args, 'presence_penalty', DEFAULT_QWEN_PRESENCE_PENALTY)):g}"
+            f"_think{1 if getattr(args, 'enable_thinking', False) else 0}"
+        )
+    return scope
 
 
 def effective_model_id(args: argparse.Namespace) -> str:
     if args.ocr_backend == "opencode_cli":
         return str(args.opencode_model)
     return str(args.model_id)
+
+
+def effective_agent_id(args: argparse.Namespace) -> str:
+    if args.ocr_backend == "opencode_cli":
+        return str(args.opencode_agent)
+    return ""
+
+
+def primary_backend_record_key(backend: str) -> str:
+    if backend == "opencode_cli":
+        return "opencode"
+    if backend == "qwen_vllm":
+        return "qwen"
+    return "primary"
 
 
 def existing_recovery_current(item: dict[str, Any], args: argparse.Namespace) -> bool:
@@ -106,6 +153,8 @@ def existing_recovery_current(item: dict[str, Any], args: argparse.Namespace) ->
     if recovery.get("engine") != args.ocr_backend:
         return False
     if recovery.get("model_id") != effective_model_id(args):
+        return False
+    if args.ocr_backend == "opencode_cli" and recovery.get("agent") != args.opencode_agent:
         return False
     if recovery.get("analysis_scope") != recovery_scope(args):
         return False
@@ -136,19 +185,98 @@ def render_pdf_page(pdf_path: Path, page_number: int, output_dir: Path, dpi: int
     return candidates[0]
 
 
-def image_data_url(path: Path, max_side: int) -> str:
-    from PIL import Image
+def prepare_ocr_image_bytes(
+    path: Path,
+    *,
+    max_side: int,
+    preprocess: str = "none",
+    upscale: float = 1.0,
+) -> tuple[bytes, dict[str, Any]]:
+    from PIL import Image, ImageFilter, ImageOps
 
     with Image.open(path) as image:
+        source_width, source_height = image.size
         image = image.convert("RGB")
-        if max(image.size) > max_side:
+
+        operations: list[str] = []
+        if preprocess in {
+            QWEN_VL_250DPI_PREPROCESSOR,
+            QWEN_VL_250DPI_GRAY_PREPROCESSOR,
+            QWEN_VL_250DPI_LIGHT_PREPROCESSOR,
+            QWEN_VL_250DPI_SHARP_PREPROCESSOR,
+            QWEN_VL_250DPI_BINARIZE_PREPROCESSOR,
+        }:
+            image = image.convert("L")
+            image = ImageOps.autocontrast(image)
+            operations.extend(["grayscale", "autocontrast"])
+            if preprocess == QWEN_VL_250DPI_PREPROCESSOR:
+                image = image.filter(ImageFilter.MedianFilter(size=3))
+                image = image.filter(ImageFilter.UnsharpMask(radius=1.1, percent=135, threshold=3))
+                operations.extend(["median3", "unsharp"])
+            elif preprocess == QWEN_VL_250DPI_LIGHT_PREPROCESSOR:
+                image = image.filter(ImageFilter.UnsharpMask(radius=0.8, percent=105, threshold=4))
+                operations.append("unsharp_light")
+            elif preprocess == QWEN_VL_250DPI_SHARP_PREPROCESSOR:
+                image = image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=180, threshold=2))
+                operations.append("unsharp_strong")
+            elif preprocess == QWEN_VL_250DPI_BINARIZE_PREPROCESSOR:
+                image = image.filter(ImageFilter.MedianFilter(size=3))
+                image = image.point(lambda pixel: 255 if pixel >= 185 else 0)
+                image = image.filter(ImageFilter.UnsharpMask(radius=0.8, percent=120, threshold=0))
+                operations.extend(["median3", "threshold185", "unsharp_binary"])
+            image = image.convert("RGB")
+        elif preprocess != "none":
+            raise ValueError(f"unknown image preprocess mode: {preprocess}")
+
+        if upscale and upscale != 1.0:
+            scaled_size = (
+                max(1, int(round(image.width * upscale))),
+                max(1, int(round(image.height * upscale))),
+            )
+            image = image.resize(scaled_size, Image.Resampling.LANCZOS)
+            operations.append(f"upscale_{upscale:g}")
+
+        resized = False
+        if max_side > 0 and max(image.size) > max_side:
             ratio = max_side / float(max(image.size))
             size = (max(1, int(round(image.width * ratio))), max(1, int(round(image.height * ratio))))
             image = image.resize(size, Image.Resampling.LANCZOS)
-        with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
-            image.save(tmp.name, format="PNG")
-            data = Path(tmp.name).read_bytes()
-    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+            resized = True
+            operations.append(f"max_side_{max_side}")
+
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        data = buffer.getvalue()
+        metadata = {
+            "source_width": source_width,
+            "source_height": source_height,
+            "width": image.width,
+            "height": image.height,
+            "format": "png",
+            "bytes": len(data),
+            "max_side": max_side,
+            "preprocess": preprocess,
+            "upscale": upscale,
+            "resized": resized,
+            "operations": operations,
+        }
+    return data, metadata
+
+
+def prepared_image_data_url(
+    path: Path,
+    *,
+    max_side: int,
+    preprocess: str = "none",
+    upscale: float = 1.0,
+) -> tuple[str, dict[str, Any]]:
+    data, metadata = prepare_ocr_image_bytes(path, max_side=max_side, preprocess=preprocess, upscale=upscale)
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii"), metadata
+
+
+def image_data_url(path: Path, max_side: int) -> str:
+    data_url, _metadata = prepared_image_data_url(path, max_side=max_side)
+    return data_url
 
 
 def cli_attachment_image(path: Path, max_side: int) -> tuple[Path, Path | None]:
@@ -221,11 +349,24 @@ def extract_json_object(text: str) -> dict[str, Any]:
         parsed = json.loads(stripped)
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start >= 0 and end > start:
-            parsed = json.loads(stripped[start : end + 1])
-            return parsed if isinstance(parsed, dict) else {}
+        decoder = json.JSONDecoder()
+        candidates: list[dict[str, Any]] = []
+        for match in re.finditer(r"\{", stripped):
+            try:
+                parsed, _ = decoder.raw_decode(stripped[match.start() :])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                candidates.append(parsed)
+        preferred = [
+            candidate
+            for candidate in candidates
+            if {"verdict", "corrected_text"} <= set(candidate) or "text" in candidate
+        ]
+        if preferred:
+            return preferred[-1]
+        if candidates:
+            return candidates[-1]
     return {}
 
 
@@ -247,11 +388,16 @@ def jsonable(value: Any) -> Any:
 
 def ocr_prompt(context: str = "") -> str:
     prompt = (
-        "You are doing OCR for a Korean government gazette scanned page. "
+        "You are doing full-page OCR for a Korean government gazette scanned page rendered at 250dpi. "
+        "Do not use MCP servers, shell tools, web tools, repository files, or network retrieval. "
+        "Use only the attached image and prompt context; built-in image inspection for the attached file is allowed. "
         "Transcribe only visible text in natural reading order. Preserve Korean Hangul/Hanja, "
         "digits, punctuation, dates, list markers, table cell text, and line breaks when clear. "
+        "For tables or multi-column areas, keep row-wise reading order and do not summarize. "
         "Do not infer text that is not visible. Return exactly one JSON object with this schema: "
-        "{\"text\":\"...\",\"confidence\":0.0,\"notes\":\"...\"}. Do not add commentary."
+        "{\"text\":\"...\",\"confidence\":0.0,\"notes\":\"...\"}. "
+        "If image inspection uses an internal image tool, do not mention the tool; return the final JSON only. "
+        "Do not add commentary, markdown fences, apologies, or capability disclaimers."
     )
     if context:
         prompt = f"{prompt}\n\nImage context: {context}"
@@ -286,9 +432,23 @@ def qwen_ocr_page(
     max_tokens: int,
     seed: int,
     max_side: int,
+    image_preprocess: str = QWEN_VL_250DPI_PREPROCESSOR,
+    image_upscale: float = 1.0,
+    temperature: float = DEFAULT_QWEN_TEMPERATURE,
+    top_p: float = DEFAULT_QWEN_TOP_P,
+    top_k: int = DEFAULT_QWEN_TOP_K,
+    min_p: float = DEFAULT_QWEN_MIN_P,
+    presence_penalty: float = DEFAULT_QWEN_PRESENCE_PENALTY,
+    enable_thinking: bool = False,
     context: str = "",
 ) -> dict[str, Any]:
     prompt = ocr_prompt(context)
+    image_url, image_metadata = prepared_image_data_url(
+        image_path,
+        max_side=max_side,
+        preprocess=image_preprocess,
+        upscale=image_upscale,
+    )
     payload = {
         "model": model_id,
         "messages": [
@@ -296,46 +456,86 @@ def qwen_ocr_page(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_data_url(image_path, max_side=max_side)}},
+                    {"type": "image_url", "image_url": {"url": image_url}},
                 ],
             }
         ],
-        "temperature": 0.0,
-        "top_p": 1.0,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "presence_penalty": presence_penalty,
         "max_tokens": max_tokens,
         "seed": seed,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
     }
-    raw = message_content(openai_chat_completion(endpoint_url, payload, timeout))
-    return ocr_result_from_response(raw, engine="qwen_vllm", model_id=model_id)
+    started_at = time.perf_counter()
+    response = openai_chat_completion(endpoint_url, payload, timeout)
+    duration_s = time.perf_counter() - started_at
+    raw = message_content(response)
+    result = ocr_result_from_response(raw, engine="qwen_vllm", model_id=model_id)
+    choice = {}
+    try:
+        choice = response["choices"][0] if response else {}
+    except (KeyError, IndexError, TypeError):
+        choice = {}
+    result["input_image"] = image_metadata
+    result["generation"] = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "presence_penalty": presence_penalty,
+        "max_tokens": max_tokens,
+        "seed": seed,
+        "enable_thinking": enable_thinking,
+    }
+    result["duration_s"] = duration_s
+    result["usage"] = response.get("usage", {}) if isinstance(response, dict) else {}
+    result["finish_reason"] = choice.get("finish_reason", "") if isinstance(choice, dict) else ""
+    return result
 
 
 def opencode_ocr_page(
     image_path: Path,
     *,
     model_id: str,
+    agent_id: str,
     timeout: float,
     max_side: int,
     context: str = "",
+    pure: bool = False,
+    skip_permissions: bool = True,
 ) -> dict[str, Any]:
     attachment_path, cleanup_path = cli_attachment_image(image_path, max_side=max_side)
     prompt = "\n".join([ocr_prompt(context), "", f"Image path: {attachment_path.resolve()}"])
     command = [
         "opencode",
         "run",
-        "-m",
-        model_id,
-        "--file",
-        str(attachment_path),
-        "--",
-        prompt,
     ]
+    if pure:
+        command.append("--pure")
+    if skip_permissions:
+        command.append("--dangerously-skip-permissions")
+    command.extend(
+        [
+            "--agent",
+            agent_id,
+            "-m",
+            model_id,
+            "--file",
+            str(attachment_path),
+            "--",
+            prompt,
+        ]
+    )
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         return {
             "engine": "opencode_cli",
             "model_id": model_id,
+            "agent": agent_id,
             "text": "",
             "confidence": 0.0,
             "notes": "",
@@ -347,6 +547,9 @@ def opencode_ocr_page(
         if cleanup_path is not None:
             cleanup_path.unlink(missing_ok=True)
     result = ocr_result_from_response(completed.stdout, engine="opencode_cli", model_id=model_id)
+    result["agent"] = agent_id
+    result["pure"] = pure
+    result["skip_permissions"] = skip_permissions
     if completed.returncode != 0:
         result.update(
             {
@@ -370,9 +573,12 @@ def run_primary_ocr_page(
         return opencode_ocr_page(
             image_path,
             model_id=args.opencode_model,
+            agent_id=args.opencode_agent,
             timeout=args.opencode_timeout,
             max_side=args.max_side,
             context=context,
+            pure=args.opencode_pure,
+            skip_permissions=args.opencode_skip_permissions,
         )
     return qwen_ocr_page(
         image_path,
@@ -382,6 +588,14 @@ def run_primary_ocr_page(
         max_tokens=args.max_tokens,
         seed=args.seed + page_number,
         max_side=args.max_side,
+        image_preprocess=args.image_preprocess,
+        image_upscale=args.image_upscale,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        presence_penalty=args.presence_penalty,
+        enable_thinking=args.enable_thinking,
         context=context,
     )
 
@@ -393,6 +607,8 @@ def peer_prompt(ocr_text: str, image_path: Path, context: str = "") -> str:
             "Compare the OCR text against the attached/local image. Do not transcribe the whole image unless needed.",
             "Return exactly one JSON object: {\"verdict\":\"accept|revise|reject\",\"corrected_text\":\"...\",\"issues\":[\"...\"],\"confidence\":0.0}.",
             "Use accept when the OCR is good enough. Use revise only when you can correct visible errors.",
+            "Do not use MCP servers, shell tools, web tools, repository files, or network retrieval.",
+            "Built-in image inspection for the attached file is allowed; do not mention tools in the final JSON.",
             "",
             f"Image context: {context}" if context else "",
             f"Image path: {image_path.resolve()}",
@@ -404,10 +620,48 @@ def peer_prompt(ocr_text: str, image_path: Path, context: str = "") -> str:
     )
 
 
-def run_peer_cli(peer: str, image_path: Path, ocr_text: str, timeout: float, context: str = "") -> dict[str, Any]:
+def run_peer_cli(
+    peer: str,
+    image_path: Path,
+    ocr_text: str,
+    timeout: float,
+    context: str = "",
+    opencode_model: str = DEFAULT_OPENCODE_MODEL_ID,
+) -> dict[str, Any]:
     prompt = peer_prompt(ocr_text, image_path, context=context)
     if peer == "agy":
         command = ["agy", "-p", prompt, "--print-timeout", f"{max(1, int(round(timeout)))}s"]
+    elif peer == "vibe":
+        command = [
+            "vibe",
+            "-p",
+            f"/peti-ocr-peer {prompt}\n\nVibe image attachment: @{image_path.resolve()}",
+            "--agent",
+            "peti-ocr-peer",
+            "--max-turns",
+            "4",
+            "--max-price",
+            "0.30",
+            "--output",
+            "text",
+            "--trust",
+            "--add-dir",
+            str(image_path.parent),
+        ]
+    elif peer == "opencode":
+        command = [
+            "opencode",
+            "run",
+            "--dangerously-skip-permissions",
+            "--agent",
+            "peti-ocr-peer",
+            "-m",
+            opencode_model,
+            "--file",
+            str(image_path),
+            "--",
+            prompt,
+        ]
     elif peer == "codex":
         command = [
             "codex",
@@ -453,14 +707,25 @@ def run_peer_cli(peer: str, image_path: Path, ocr_text: str, timeout: float, con
     }
 
 
+def peer_confidence(result: dict[str, Any]) -> float:
+    try:
+        return max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def choose_final_text(qwen_result: dict[str, Any], peer_results: dict[str, dict[str, Any]]) -> tuple[str, str]:
     revisions = [
-        result.get("corrected_text", "")
+        (peer_confidence(result), result.get("corrected_text", ""))
         for result in peer_results.values()
-        if result.get("status") == "ok" and result.get("verdict") == "revise" and result.get("corrected_text")
+        if result.get("status") == "ok"
+        and result.get("verdict") == "revise"
+        and result.get("corrected_text")
+        and peer_confidence(result) >= 0.8
     ]
     if revisions:
-        return str(revisions[0]), "peer_revision"
+        revisions.sort(key=lambda item: item[0], reverse=True)
+        return str(revisions[0][1]), "peer_revision"
     engine = str(qwen_result.get("engine") or "primary")
     source = "qwen_primary" if engine == "qwen_vllm" else f"{engine}_primary"
     return str(qwen_result.get("text", "")), source
@@ -522,6 +787,7 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
                             primary_ocr.get("text", ""),
                             timeout=args.peer_timeout,
                             context=context,
+                            opencode_model=args.opencode_model,
                         )
                         for peer in peers
                         if primary_ocr.get("text")
@@ -536,7 +802,7 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
                         "final_text": final_text,
                         "final_source": final_source,
                     }
-                    image_record["opencode" if args.ocr_backend == "opencode_cli" else "qwen"] = primary_ocr
+                    image_record[primary_backend_record_key(args.ocr_backend)] = primary_ocr
                     image_records.append(image_record)
                 final_text = normalize_text(
                     "\n".join(record.get("final_text", "") for record in image_records if record.get("final_text"))
@@ -558,6 +824,8 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
                             "mode": page_mode,
                             "image_count": len(image_records),
                             "input_max_side": args.max_side,
+                            "image_preprocess": args.image_preprocess,
+                            "image_upscale": args.image_upscale,
                         },
                         "images": image_records,
                         "final_text": final_text,
@@ -573,6 +841,7 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
         "created_at": iso_now(),
         "engine": args.ocr_backend,
         "model_id": effective_model_id(args),
+        "agent": effective_agent_id(args),
         "endpoint_url": args.endpoint_url if args.ocr_backend == "qwen_vllm" else "",
         "analysis_scope": recovery_scope(args),
         "pages_total": pages_total,
@@ -581,10 +850,21 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
             "dpi": args.dpi,
             "page_ocr_mode": "single_page",
             "max_side": args.max_side,
+            "image_preprocess": args.image_preprocess,
+            "image_upscale": args.image_upscale,
             "a4_250dpi_reference": {
                 "width": A4_250DPI_WIDTH,
                 "height": A4_250DPI_HEIGHT,
             },
+        },
+        "qwen_generation": {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+            "presence_penalty": args.presence_penalty,
+            "max_tokens": args.max_tokens,
+            "enable_thinking": args.enable_thinking,
         },
         "peers": peers,
         "text": recovered_text,
@@ -618,10 +898,31 @@ def main() -> int:
     parser.add_argument("--endpoint-url", default="http://127.0.0.1:30000", help="qwen_vllm OpenAI-compatible endpoint")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="qwen_vllm model id")
     parser.add_argument("--opencode-model", default=DEFAULT_OPENCODE_MODEL_ID, help="opencode CLI model id")
+    parser.add_argument("--opencode-agent", default=DEFAULT_OPENCODE_AGENT_ID, help="opencode primary OCR agent id")
+    parser.add_argument(
+        "--opencode-pure",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run opencode without external plugins. Disabled by default because OCR needs image attachment inspection.",
+    )
+    parser.add_argument(
+        "--opencode-skip-permissions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-approve opencode image attachment access while agent-level bash/edit/write denies remain active.",
+    )
     parser.add_argument("--max-pages", type=int, default=3)
     parser.add_argument("--dpi", type=int, default=250)
     parser.add_argument("--max-side", type=int, default=A4_250DPI_HEIGHT)
+    parser.add_argument("--image-preprocess", choices=IMAGE_PREPROCESSORS, default=QWEN_VL_250DPI_PREPROCESSOR)
+    parser.add_argument("--image-upscale", type=float, default=1.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_QWEN_TEMPERATURE)
+    parser.add_argument("--top-p", type=float, default=DEFAULT_QWEN_TOP_P)
+    parser.add_argument("--top-k", type=int, default=DEFAULT_QWEN_TOP_K)
+    parser.add_argument("--min-p", type=float, default=DEFAULT_QWEN_MIN_P)
+    parser.add_argument("--presence-penalty", type=float, default=DEFAULT_QWEN_PRESENCE_PENALTY)
+    parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--qwen-timeout", type=float, default=420.0)
     parser.add_argument("--opencode-timeout", type=float, default=180.0)
     parser.add_argument("--peer-timeout", type=float, default=300.0)
@@ -634,8 +935,20 @@ def main() -> int:
     args = parser.parse_args()
     if args.max_side <= 0:
         parser.error("--max-side must be positive")
+    if args.image_upscale <= 0:
+        parser.error("--image-upscale must be positive")
+    if args.temperature < 0:
+        parser.error("--temperature must be non-negative")
+    if not 0.0 < args.top_p <= 1.0:
+        parser.error("--top-p must be in (0, 1]")
+    if args.top_k < 0:
+        parser.error("--top-k must be non-negative")
+    if not 0.0 <= args.min_p <= 1.0:
+        parser.error("--min-p must be in [0, 1]")
     if args.ocr_backend == "opencode_cli" and not args.opencode_model.strip():
         parser.error("--opencode-model must be non-empty for opencode_cli")
+    if args.ocr_backend == "opencode_cli" and not args.opencode_agent.strip():
+        parser.error("--opencode-agent must be non-empty for opencode_cli")
     if args.dpi < 250:
         print(
             f"warning: dpi={args.dpi} is below A4 250dpi recovery target; use --dpi 250 for target coverage",
@@ -653,7 +966,8 @@ def main() -> int:
     print(
         f"vlm ocr recovery started: {iso_now()} items={len(paths)} max_pages={args.max_pages} "
         f"dpi={args.dpi} page_ocr_mode=single_page max_side={args.max_side} "
-        f"backend={args.ocr_backend} model={effective_model_id(args)} peers={args.peers}",
+        f"image_preprocess={args.image_preprocess} image_upscale={args.image_upscale:g} "
+        f"backend={args.ocr_backend} model={effective_model_id(args)} agent={effective_agent_id(args)} peers={args.peers}",
         flush=True,
     )
 
