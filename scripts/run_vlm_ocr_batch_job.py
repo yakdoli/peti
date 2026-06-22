@@ -31,6 +31,7 @@ from scripts.recover_ocr_needed_with_vlm import (  # noqa: E402
     DEFAULT_QWEN_TOP_K,
     DEFAULT_QWEN_TOP_P,
     IMAGE_PREPROCESSORS,
+    QWEN_API_PROFILES,
     QWEN_VL_250DPI_SHARP_PREPROCESSOR,
     choose_final_text,
     image_size,
@@ -253,7 +254,17 @@ def cli_primary_ocr_page(
                 f"![page]({image_path.resolve()})",
             ]
         )
-        command = ["codex", "exec", "--sandbox", "read-only", "-i", str(image_path), "--", prompt]
+        command = [
+            "codex",
+            "exec",
+            "--ignore-user-config",
+            "--sandbox",
+            "read-only",
+            "-i",
+            str(image_path),
+            "--",
+            prompt,
+        ]
         engine = "codex_cli"
     else:
         return {"status": "error", "engine": backend, "error": f"unsupported primary backend: {backend}"}
@@ -319,6 +330,9 @@ def run_primary_ocr_page(
             min_p=args.min_p,
             presence_penalty=args.presence_penalty,
             enable_thinking=args.enable_thinking,
+            thinking_budget=args.thinking_budget,
+            api_profile=args.qwen_api_profile,
+            api_key_env=args.qwen_api_key_env,
             context=context,
         )
     if args.primary == "opencode_cli":
@@ -521,6 +535,8 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path, output_d
             "presence_penalty": args.presence_penalty,
             "max_tokens": args.max_tokens,
             "enable_thinking": args.enable_thinking,
+            "thinking_budget": args.thinking_budget,
+            "qwen_api_profile": args.qwen_api_profile,
         },
         "text": recovered_text,
         "pages": recovery_pages,
@@ -655,6 +671,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-p", type=float, default=DEFAULT_QWEN_MIN_P)
     parser.add_argument("--presence-penalty", type=float, default=DEFAULT_QWEN_PRESENCE_PENALTY)
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument("--thinking-budget", type=int, default=0)
+    parser.add_argument("--qwen-api-profile", choices=QWEN_API_PROFILES, default="local")
+    parser.add_argument("--qwen-api-key-env", default="")
     parser.add_argument("--qwen-timeout", type=float, default=600.0)
     parser.add_argument("--primary-cli-timeout", type=float, default=360.0)
     parser.add_argument("--peer-timeout", type=float, default=300.0)

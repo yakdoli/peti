@@ -48,6 +48,7 @@ IMAGE_PREPROCESSORS = (
     QWEN_VL_250DPI_SHARP_PREPROCESSOR,
     QWEN_VL_250DPI_BINARIZE_PREPROCESSOR,
 )
+QWEN_API_PROFILES = ("local", "dashscope")
 DEFAULT_QWEN_TEMPERATURE = 0.2
 DEFAULT_QWEN_TOP_P = 0.8
 DEFAULT_QWEN_TOP_K = 20
@@ -319,11 +320,33 @@ def page_ocr_images(page_image: Path, output_dir: Path, args: argparse.Namespace
     ]
 
 
-def openai_chat_completion(endpoint_url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any] | None:
+def openai_chat_completions_url(endpoint_url: str) -> str:
+    base = endpoint_url.rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+def openai_request_headers(api_key_env: str = "") -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key_env:
+        api_key = os.environ.get(api_key_env, "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def openai_chat_completion(
+    endpoint_url: str,
+    payload: dict[str, Any],
+    timeout: float,
+    *,
+    api_key_env: str = "",
+) -> dict[str, Any] | None:
     request = urllib.request.Request(
-        f"{endpoint_url.rstrip('/')}/v1/chat/completions",
+        openai_chat_completions_url(endpoint_url),
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=openai_request_headers(api_key_env),
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -449,6 +472,9 @@ def qwen_ocr_page(
     min_p: float = DEFAULT_QWEN_MIN_P,
     presence_penalty: float = DEFAULT_QWEN_PRESENCE_PENALTY,
     enable_thinking: bool = False,
+    thinking_budget: int = 0,
+    api_profile: str = "local",
+    api_key_env: str = "",
     context: str = "",
 ) -> dict[str, Any]:
     prompt = ocr_prompt(context)
@@ -471,15 +497,20 @@ def qwen_ocr_page(
         ],
         "temperature": temperature,
         "top_p": top_p,
-        "top_k": top_k,
-        "min_p": min_p,
-        "presence_penalty": presence_penalty,
         "max_tokens": max_tokens,
         "seed": seed,
-        "chat_template_kwargs": {"enable_thinking": enable_thinking},
     }
+    if api_profile == "dashscope":
+        payload["enable_thinking"] = enable_thinking
+        if thinking_budget > 0:
+            payload["thinking_budget"] = thinking_budget
+    else:
+        payload["top_k"] = top_k
+        payload["min_p"] = min_p
+        payload["presence_penalty"] = presence_penalty
+        payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
     started_at = time.perf_counter()
-    response = openai_chat_completion(endpoint_url, payload, timeout)
+    response = openai_chat_completion(endpoint_url, payload, timeout, api_key_env=api_key_env)
     duration_s = time.perf_counter() - started_at
     raw = message_content(response)
     result = ocr_result_from_response(raw, engine="qwen_vllm", model_id=model_id)
@@ -498,6 +529,8 @@ def qwen_ocr_page(
         "max_tokens": max_tokens,
         "seed": seed,
         "enable_thinking": enable_thinking,
+        "thinking_budget": thinking_budget,
+        "api_profile": api_profile,
     }
     result["duration_s"] = duration_s
     result["usage"] = response.get("usage", {}) if isinstance(response, dict) else {}
@@ -682,6 +715,9 @@ def run_primary_ocr_page(
         min_p=args.min_p,
         presence_penalty=args.presence_penalty,
         enable_thinking=args.enable_thinking,
+        thinking_budget=args.thinking_budget,
+        api_profile=args.qwen_api_profile,
+        api_key_env=args.qwen_api_key_env,
         context=context,
     )
 
@@ -762,6 +798,7 @@ def run_peer_cli(
         command = [
             "codex",
             "exec",
+            "--ignore-user-config",
             "--sandbox",
             "read-only",
             "-i",
@@ -971,6 +1008,8 @@ def process_item(path: Path, args: argparse.Namespace, repo_root: Path) -> dict[
             "presence_penalty": args.presence_penalty,
             "max_tokens": args.max_tokens,
             "enable_thinking": args.enable_thinking,
+            "thinking_budget": args.thinking_budget,
+            "qwen_api_profile": args.qwen_api_profile,
         },
         "peers": peers,
         "text": recovered_text,
@@ -1030,6 +1069,9 @@ def main() -> int:
     parser.add_argument("--min-p", type=float, default=DEFAULT_QWEN_MIN_P)
     parser.add_argument("--presence-penalty", type=float, default=DEFAULT_QWEN_PRESENCE_PENALTY)
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument("--thinking-budget", type=int, default=0)
+    parser.add_argument("--qwen-api-profile", choices=QWEN_API_PROFILES, default="local")
+    parser.add_argument("--qwen-api-key-env", default="")
     parser.add_argument("--qwen-timeout", type=float, default=420.0)
     parser.add_argument("--opencode-timeout", type=float, default=180.0)
     parser.add_argument("--claude-timeout", type=float, default=360.0)

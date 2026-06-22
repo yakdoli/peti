@@ -84,10 +84,11 @@ def test_qwen_ocr_page_uses_optimized_250dpi_payload(monkeypatch, tmp_path):
     Image.new("RGB", (A4_250DPI_WIDTH, A4_250DPI_HEIGHT), "white").save(page)
     seen = {}
 
-    def fake_chat_completion(endpoint_url, payload, timeout):
+    def fake_chat_completion(endpoint_url, payload, timeout, *, api_key_env=""):
         seen["endpoint_url"] = endpoint_url
         seen["payload"] = payload
         seen["timeout"] = timeout
+        seen["api_key_env"] = api_key_env
         return {
             "choices": [{"finish_reason": "stop", "message": {"content": '{"text":"관보","confidence":0.91,"notes":"ok"}'}}],
             "usage": {"completion_tokens": 2, "prompt_tokens": 100, "total_tokens": 102},
@@ -118,6 +119,7 @@ def test_qwen_ocr_page_uses_optimized_250dpi_payload(monkeypatch, tmp_path):
     image_url = payload["messages"][0]["content"][1]["image_url"]["url"]
     assert seen["endpoint_url"] == "http://127.0.0.1:30000"
     assert seen["timeout"] == 11
+    assert seen["api_key_env"] == ""
     assert image_url.startswith("data:image/png;base64,")
     assert payload["temperature"] == 0.2
     assert payload["top_p"] == 0.8
@@ -136,6 +138,59 @@ def test_qwen_ocr_page_uses_optimized_250dpi_payload(monkeypatch, tmp_path):
     assert result["generation"]["min_p"] == 0.0
     assert result["usage"]["total_tokens"] == 102
     assert result["finish_reason"] == "stop"
+
+
+def test_qwen_ocr_page_dashscope_payload_uses_image_url_and_enable_thinking(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    seen = {}
+
+    def fake_chat_completion(endpoint_url, payload, timeout, *, api_key_env=""):
+        seen["endpoint_url"] = endpoint_url
+        seen["payload"] = payload
+        seen["timeout"] = timeout
+        seen["api_key_env"] = api_key_env
+        return {
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"text":"관보","confidence":0.8,"notes":"ok"}'}}],
+            "usage": {"total_tokens": 42},
+        }
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.openai_chat_completion", fake_chat_completion)
+
+    result = qwen_ocr_page(
+        page,
+        endpoint_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        model_id="qwen3.6-plus",
+        timeout=22,
+        max_tokens=1024,
+        seed=3,
+        max_side=100,
+        image_preprocess="none",
+        image_upscale=1.0,
+        temperature=0.2,
+        top_p=0.8,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=1.5,
+        enable_thinking=True,
+        thinking_budget=256,
+        api_profile="dashscope",
+        api_key_env="DASHSCOPE_API_KEY",
+        context="page=1",
+    )
+
+    payload = seen["payload"]
+    assert seen["endpoint_url"] == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    assert seen["api_key_env"] == "DASHSCOPE_API_KEY"
+    assert payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert payload["enable_thinking"] is True
+    assert payload["thinking_budget"] == 256
+    assert "chat_template_kwargs" not in payload
+    assert "top_k" not in payload
+    assert "min_p" not in payload
+    assert "presence_penalty" not in payload
+    assert result["generation"]["api_profile"] == "dashscope"
+    assert result["generation"]["thinking_budget"] == 256
 
 
 def test_qwen_recovery_scope_includes_preprocess_and_generation_settings():
@@ -397,6 +452,32 @@ def test_run_peer_cli_supports_opencode_agent(monkeypatch, tmp_path):
     assert seen["command"][7:9] == ["--file", str(page)]
     assert seen["command"][9] == "--"
     assert "Primary OCR text:" in seen["command"][10]
+    assert seen["timeout"] == 35
+
+
+def test_run_peer_cli_supports_codex_without_user_config(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"verdict":"accept","corrected_text":"","issues":[],"confidence":0.9}'
+        stderr = ""
+
+    def fake_run(command, capture_output, text, timeout, check):
+        seen["command"] = command
+        seen["timeout"] = timeout
+        return Completed()
+
+    monkeypatch.setattr("scripts.recover_ocr_needed_with_vlm.subprocess.run", fake_run)
+
+    result = run_peer_cli("codex", page, "primary text", timeout=20, context="page=1")
+
+    assert result["status"] == "ok"
+    assert result["verdict"] == "accept"
+    assert seen["command"][:5] == ["codex", "exec", "--ignore-user-config", "--sandbox", "read-only"]
+    assert seen["command"][seen["command"].index("-i") + 1] == str(page)
     assert seen["timeout"] == 35
 
 

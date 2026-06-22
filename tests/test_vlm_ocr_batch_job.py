@@ -498,6 +498,6 @@ def test_cli_primary_ocr_page_supports_codex(monkeypatch, tmp_path):
     assert result["status"] == "ok"
     assert result["engine"] == "codex_cli"
     assert result["text"] == "관보"
-    assert seen["command"][:4] == ["codex", "exec", "--sandbox", "read-only"]
-    assert seen["command"][4:6] == ["-i", str(image)]
+    assert seen["command"][:5] == ["codex", "exec", "--ignore-user-config", "--sandbox", "read-only"]
+    assert seen["command"][5:7] == ["-i", str(image)]
     assert seen["timeout"] == 45
