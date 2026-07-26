@@ -1,8 +1,7 @@
 """Tests for SearchThema parser."""
 
-from search_thema_parser import (  # type: ignore[reportMissingImports]
+from src.search_thema_parser import (
     SearchThemaItem,
-    SearchThemaPage,
     parse_search_thema_response,
 )
 
