@@ -210,7 +210,7 @@ def test_pdf_header_validation(crawler: SearchThemaCrawler, tmp_path: Path) -> N
         patch("base_crawler.aiohttp.ClientSession", return_value=FakeStreamSession()),
     ):
         result = asyncio.run(crawler._download_pdf_stream(
-            crawler._empty_cookie_context(),
+            crawler._cookie_context([]),
             "https://gwanbo.go.kr/user/common/ofcttCntntDownload.do",
             {"cntnt_seq_no": "toc"},
             pdf_path,

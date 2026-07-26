@@ -208,7 +208,7 @@ async def download_candidate(
         return {"scope": scope, "status": "error", "error": "download request is unavailable"}
     try:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        download = await crawler._download_pdf_stream(crawler._empty_cookie_context(), request[0], request[1], target_path)
+        download = await crawler._download_pdf_stream(crawler._cookie_context([]), request[0], request[1], target_path)
     except Exception as exc:
         return {"scope": scope, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
