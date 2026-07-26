@@ -40,6 +40,13 @@ def resolve_path(path_text: str, repo_root: Path) -> Path:
     return (repo_root / path).resolve()
 
 
+def trusted_artifact_path(path: Path, artifacts_root: Path) -> Path | None:
+    if path.is_symlink():
+        return None
+    resolved = path.resolve()
+    return resolved if resolved.is_relative_to(artifacts_root.resolve()) else None
+
+
 def pdf_complete(path: Path) -> bool:
     try:
         size = path.stat().st_size
@@ -109,7 +116,9 @@ def build_pdf_index(pdf_dir: Path) -> dict[str, list[Path]]:
     for path in pdf_dir.rglob("*.pdf"):
         if path.name.endswith(".pdf.tmp"):
             continue
-        index[path.name].append(path.resolve())
+        trusted_path = trusted_artifact_path(path, pdf_dir)
+        if trusted_path is not None:
+            index[path.name].append(trusted_path)
     return index
 
 
@@ -130,9 +139,16 @@ def candidate_paths(
     pdf = item.get("pdf") if isinstance(item.get("pdf"), dict) else {}
     path_text = str((pdf or {}).get("path") or "").strip()
     if path_text:
-        candidates.append(resolve_path(path_text, repo_root))
+        item_pdf_path = Path(path_text)
+        if not item_pdf_path.is_absolute():
+            item_pdf_path = repo_root / item_pdf_path
+        trusted_path = trusted_artifact_path(item_pdf_path, artifacts_root)
+        if trusted_path is not None:
+            candidates.append(trusted_path)
 
-    candidates.append(expected_pdf_path(artifacts_root, item).resolve())
+    expected_path = trusted_artifact_path(expected_pdf_path(artifacts_root, item), artifacts_root)
+    if expected_path is not None:
+        candidates.append(expected_path)
 
     names: list[str] = []
     if path_text:
