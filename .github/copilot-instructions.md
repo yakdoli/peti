@@ -23,7 +23,7 @@ ko-perty/
 │   ├── metadata_manager.py  # 메타데이터 관리
 │   └── pdf_handler.py       # PDF 처리
 ├── crawl.py                 # 관보 크롤러 진입점
-├── crawl_search_thema.py    # SearchThema 진입점
+├── crawl.py search-thema    # SearchThema 서브커맨드
 ├── artifacts/
 │   ├── pdfs/                # 다운로드 PDF
 │   ├── metadata/            # 메타데이터 JSON/CSV
