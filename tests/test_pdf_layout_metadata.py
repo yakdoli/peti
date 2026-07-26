@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 
+import pytest
+
+from gwanbo_ocr.pdf.io import UnsafePathError, resolve_pdf_path
 from src import pdf_layout_metadata
 from src.pdf_layout_metadata import (
     analyze_page_layout,
@@ -98,8 +101,8 @@ class SparseTextPage(TextFallbackPage):
         return []
 
 
-def write_item(path: Path, pdf_path: Path, text_extractable: bool, pdf_status: str = "completed") -> None:
-    path.parent.mkdir(parents=True)
+def write_item(path: Path, pdf_path: Path | str, text_extractable: bool, pdf_status: str = "completed") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
@@ -230,3 +233,82 @@ def test_generate_source_layout_metadata_writes_fake_pdfplumber_sidecar(tmp_path
     assert item["pdf_layout"]["status"] == "ok"
     assert item["pdf_layout"]["table_count"] == 1
     assert "tables" not in item["pdf_layout"]
+
+
+def test_resolve_pdf_path_accepts_repo_relative_artifacts_paths(tmp_path: Path) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    pdf_path = artifacts_root / "searchThema" / "pdfs" / "2024" / "20240101" / "abc.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF")
+
+    resolved = resolve_pdf_path(
+        {"pdf_path": "artifacts/searchThema/pdfs/2024/20240101/abc.pdf"},
+        base_dir=artifacts_root.parent,
+        peti_root=artifacts_root.parent,
+        trusted_root=artifacts_root,
+    )
+
+    assert resolved == pdf_path.resolve()
+
+
+def test_resolve_pdf_path_rejects_outside_root_and_symlink_escape(tmp_path: Path) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    artifacts_root.mkdir()
+    outside_pdf = tmp_path / "outside.pdf"
+    outside_pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    link_pdf = artifacts_root / "searchThema" / "pdfs" / "2024" / "20240101" / "link.pdf"
+    link_pdf.parent.mkdir(parents=True)
+    link_pdf.symlink_to(outside_pdf)
+
+    with pytest.raises(UnsafePathError):
+        resolve_pdf_path(
+            {"pdf_path": str(outside_pdf)},
+            base_dir=artifacts_root.parent,
+            peti_root=artifacts_root.parent,
+            trusted_root=artifacts_root,
+        )
+
+    with pytest.raises(UnsafePathError):
+        resolve_pdf_path(
+            {"pdf_path": "artifacts/searchThema/pdfs/2024/20240101/link.pdf"},
+            base_dir=artifacts_root.parent,
+            peti_root=artifacts_root.parent,
+            trusted_root=artifacts_root,
+        )
+
+
+def test_generate_source_layout_metadata_skips_unsafe_pdf_paths_and_keeps_processing_later_items(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(pdf_layout_metadata, "pdfplumber", FakePdfPlumber())
+    root = tmp_path / "artifacts"
+    source_root = root / "searchThema"
+    pdf_dir = source_root / "pdfs" / "2024" / "20240101"
+    item_dir = source_root / "metadata" / "items" / "2024" / "20240101"
+    pdf_dir.mkdir(parents=True)
+
+    outside_pdf = tmp_path / "outside.pdf"
+    outside_pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    symlink_pdf = pdf_dir / "symlink.pdf"
+    symlink_pdf.symlink_to(outside_pdf)
+
+    safe_pdf = pdf_dir / "safe.pdf"
+    safe_pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+
+    write_item(item_dir / "unsafe-absolute.json", outside_pdf, text_extractable=True)
+    write_item(item_dir / "unsafe-symlink.json", symlink_pdf, text_extractable=True)
+    write_item(item_dir / "safe.json", "artifacts/searchThema/pdfs/2024/20240101/safe.pdf", text_extractable=True)
+
+    summary = generate_source_layout_metadata("searchThema", artifacts_root=root, workers=1)
+
+    unsafe_sidecar = source_root / "layout_metadata" / "items" / "2024" / "20240101" / "unsafe-absolute.json"
+    safe_sidecar = source_root / "layout_metadata" / "items" / "2024" / "20240101" / "safe.json"
+    index = json.loads((source_root / "layout_metadata" / "metadata.json").read_text(encoding="utf-8"))
+
+    assert summary["eligible"] == 1
+    assert summary["processed"] == 1
+    assert summary["skipped_unsafe_pdf_path"] == 2
+    assert summary["updated_items"] == 1
+    assert not unsafe_sidecar.exists()
+    assert safe_sidecar.exists()
+    assert "2024/20240101/safe" in index

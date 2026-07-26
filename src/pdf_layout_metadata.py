@@ -25,7 +25,8 @@ except ImportError:
         sync_pdf_layout_metadata,
     )
 
-from src.pdf_text_metadata import SOURCE_NAMES
+from gwanbo_ocr.pdf.io import UnsafePathError, resolve_pdf_path
+from src.pdf_text_metadata import SOURCE_NAMES, normalize_text, _raise_timeout
 
 try:
     import pdfplumber  # type: ignore[reportMissingImports]
@@ -450,6 +451,7 @@ def generate_source_layout_metadata(
         "skipped_not_completed": 0,
         "skipped_not_text_extractable": 0,
         "skipped_missing_pdf_path": 0,
+        "skipped_unsafe_pdf_path": 0,
         "json_errors": 0,
         "errors": 0,
         "updated_items": 0,
@@ -490,7 +492,17 @@ def generate_source_layout_metadata(
             summary["skipped_missing_pdf_path"] += 1
             continue
 
-        resolved_pdf_path = resolve_path(pdf_path_text, artifacts_root)
+        try:
+            resolved_pdf_path = resolve_pdf_path(
+                {"pdf_path": pdf_path_text},
+                base_dir=artifacts_root.parent,
+                peti_root=artifacts_root.parent,
+                trusted_root=artifacts_root,
+            )
+        except UnsafePathError:
+            summary["skipped_unsafe_pdf_path"] += 1
+            continue
+
         summary["eligible"] += 1
         work_items.append(
             {
@@ -824,10 +836,6 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
-def normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def count_lines(text: str) -> int:
     return len([line for line in text.splitlines() if line.strip()])
 
@@ -856,7 +864,3 @@ def safe_call(func: Any, *args: Any, **kwargs: Any) -> Any:
 
 def iso_now() -> str:
     return datetime.now().isoformat()
-
-
-def _raise_timeout(_signum: int, _frame: Any) -> None:
-    raise TimeoutError("PDF layout analysis timed out")
