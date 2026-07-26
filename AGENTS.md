@@ -1,55 +1,49 @@
-# Codex project instructions: peti
+# PROJECT KNOWLEDGE BASE
 
-## Project purpose
+## OVERVIEW
 
-This repository is a Python crawler for Korean electronic gazette data. It collects public-official asset disclosure metadata and PDFs from `petyListAjax` and `SearchRestApi`, writes resumable crawler state, and prepares artifacts for OCR and Hugging Face dataset export.
+Resumable Python crawler and artifact pipeline for PETY and SearchThema gazette metadata/PDFs. Runtime collection, OCR metadata, exports, and source code share one repository but have separate boundaries.
 
-## Repository boundaries
+## WHERE TO LOOK
 
-- Treat `src/`, root crawler entrypoints, `scripts/`, `config/`, tests, and documentation as source/configuration.
-- Treat `artifacts/`, `datasets/`, `logs/`, `data/`, generated PDFs, OCR images, DuckDB exports, and upload checkpoints as generated outputs unless the user explicitly asks to inspect or modify them.
-- Do not commit or normalize large generated artifacts as part of code changes.
-- Preserve the separation described in `PROJECT_LAYOUT.md`: crawler source, collection artifacts, OCR-ready artifacts, and Hugging Face dataset exports are separate concerns.
+| Task | Location | Notes |
+|------|----------|-------|
+| Run collection | `crawl.py` | `pety`, `search-thema`, and `batch` modes |
+| PETY collection | `src/crawler.py` | Playwright/session-backed AJAX and PDF access |
+| SearchThema collection | `src/crawler_search_thema.py` | Search API, resume logic, PDF fallback |
+| Shared network behavior | `src/base_crawler.py` | Throttling, retries, downloads |
+| Metadata contract | `src/metadata_schema.py` | Shared envelope and synchronization rules |
+| Persist metadata | `src/metadata_manager.py` | Item files and aggregate indexes |
+| Resume state | `src/crawl_state.py` | State must survive interrupted runs |
+| Tune collection | `config/config.yaml` | URLs, dates, windows, concurrency, timeouts |
+| Export/diagnose | `scripts/` | Some legacy workflows still consume `data/searchThema/` |
+| Validate behavior | `tests/` | Async tests, fixtures, crawler/OCR metadata coverage |
 
-## Main modules
+## CONVENTIONS
 
-- `src/crawler.py`: `pety` crawler using Playwright/session-backed access to the public Gwanbo screen and AJAX endpoints.
-- `src/crawler_search_thema.py`: `searchThema` crawler using HTTP POST against Gwanbo search APIs.
-- `src/base_crawler.py`: shared async HTTP and PDF download behavior.
-- `src/metadata_manager.py`: metadata item/index read/write behavior.
-- `src/crawl_state.py`: resumable crawl state.
-- `src/pety_parser.py` and `src/search_thema_parser.py`: source-specific parsing.
-- `src/pdf_validator.py` and `validate_pdfs.py`: PDF validation.
-- `scripts/final_upload_chunks.py`, `scripts/batched_upload_pdfs.py`, and related scripts: dataset/export/diagnostic workflows.
+- Treat `src/`, `crawl.py`, `validate_pdfs.py`, `scripts/`, `config/`, tests, and docs as source/configuration.
+- `artifacts/` is the canonical runtime-output root: metadata, PDFs, OCR-ready files, state, and validation reports.
+- `data/searchThema/` is a legacy/export boundary used by selected batch, DuckDB, and Hugging Face scripts; do not make it the default runtime path.
+- Change date ranges, throttling, retries, windows, pagination, and concurrency in `config/config.yaml` before changing crawler code.
+- Preserve per-item metadata, aggregate indexes, hashes, and resumable state together.
+- Keep Korean source values and identifiers unchanged.
 
-## Configuration
+## ANTI-PATTERNS
 
-- Primary crawler configuration is `config/config.yaml`.
-- Date ranges, throttling, timeouts, `window_days`, `row_per_page`, and `max_concurrent_downloads` should be changed in configuration before changing crawler code.
-- Keep external URLs and source-specific API parameters centralized in `config/config.yaml` unless there is a clear reason not to.
+- Do not recursively inspect or normalize `artifacts/`, `data/`, `datasets/`, `logs/`, or `sync_work/` during source changes.
+- Do not run long crawls, broad downloads, Playwright installs, Hugging Face uploads, or artifact cleanup without explicit operator intent.
+- Do not bypass retry, timeout, throttling, file-size, integrity, or resume gates.
+- Do not trigger OCR fallback/peer review when digital-PDF evidence or confidence gates say it is unnecessary.
+- Do not reintroduce stale `src/pdf_handler.py` guidance; current OCR metadata modules are `pdf_text_metadata.py`, `pdf_layout_metadata.py`, and `pdf_extraction_peer_review.py`.
 
-## Working rules for Codex
-
-- Prefer small, targeted edits that preserve crawler resumability and existing artifact layout.
-- Before changing network behavior, account for retry limits, timeout behavior, server load, and resumability from `artifacts/state/`.
-- Do not run long crawls, broad downloads, Playwright browser installs, Hugging Face uploads, or destructive artifact cleanup unless the user explicitly asks.
-- Do not inspect generated artifacts by default; they can be large.
-- When library or API usage is uncertain, use Context7 MCP for current docs before changing code.
-- When working on Hugging Face dataset upload/export scripts, prefer the Hugging Face plugin/tools when current Hub behavior matters.
-
-## Common commands
+## COMMANDS
 
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install chromium
-python crawl.py
-python crawl.py --metadata-only --start-date 2026-04-24 --end-date 2026-04-24
-python crawl.py --rebuild-index
-python crawl_search_thema.py --resume
-python validate_pdfs.py
 pytest tests/
+python crawl.py --metadata-only --start-date 2026-04-24 --end-date 2026-04-24 --limit 1
+python crawl.py search-thema --resume
+python crawl.py batch --help
+python validate_pdfs.py
 ```
 
-Do not run these commands unless the user asks for execution or validation.
+Full collection and upload commands are operational actions, not routine validation.
