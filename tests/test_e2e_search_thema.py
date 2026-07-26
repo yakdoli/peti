@@ -130,7 +130,7 @@ def test_full_pdf_flow(e2e_crawler_factory, search_thema_items: list[dict]) -> N
     )
     pdf_body = b"%PDF-1.4 e2e"
 
-    async def fake_download(download_item: dict) -> dict:
+    async def fake_download(download_item: dict, _session_entry: dict | None = None) -> dict:
         pdf_path = crawler._pdf_path_for_item(download_item)
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         pdf_path.write_bytes(pdf_body)

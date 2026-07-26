@@ -39,7 +39,7 @@ async def _run() -> None:
     )
     pdf_body = b"%PDF-1.4 smoke"
 
-    async def fake_download(download_item: dict) -> dict:
+    async def fake_download(download_item: dict, _session_entry: dict | None = None) -> dict:
         pdf_path = crawler._pdf_path_for_item(download_item)
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         pdf_path.write_bytes(pdf_body)
