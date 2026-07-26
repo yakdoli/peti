@@ -23,12 +23,19 @@
 ## 설치
 
 ```bash
-cd /Users/yakdoli/workspace/ko-perty
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 python -m playwright install chromium
 ```
+
+`requirements.txt`의 `gwanbo-ocr[pdf]`는 PyPI 패키지가 아니라 GitHub 저장소
+[`yakdoli/gwanbo-ocr`](https://github.com/yakdoli/gwanbo-ocr)의 불변 커밋
+SHA `bfc350d815eb79bd726e35ddb765cf16692418f6`를 가리키는
+`git+https` VCS 의존성입니다. `pip install -r requirements.txt`는 이 커밋을
+직접 clone하여 설치하므로, 설치 과정에 Git 실행 파일과 GitHub에 대한
+네트워크 접근이 필요합니다. 아직 릴리스나 태그, PyPI 배포본은 존재하지
+않습니다.
 
 OCR 준비 기능을 사용할 경우 macOS에서는 Poppler가 필요합니다.
 
