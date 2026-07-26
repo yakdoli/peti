@@ -11,11 +11,13 @@ import signal
 import subprocess
 from contextlib import contextmanager
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, Iterable, Iterator
+from typing import Any, Dict, Iterator
 
 from PyPDF2 import PdfReader
+from gwanbo_ocr.pdf.text_class import PdfTextSignals, classify_pdf_text_metadata
 
 try:
     from .metadata_schema import apply_item_schema, sync_pdf_text_metadata
@@ -195,7 +197,8 @@ def generate_source_text_metadata(
     class_counts: Dict[str, int] = {}
     index: Dict[str, Dict[str, Any]] = {}
 
-    for pdf_path in limited(iter_pdf_paths(pdf_dir), limit):
+    paths = (path for path in sorted(pdf_dir.rglob("*.pdf")) if not path.is_symlink() and path.resolve().is_relative_to(pdf_dir.resolve()) and path.is_file()) if pdf_dir.exists() else ()
+    for pdf_path in islice(paths, limit):
         summary["total_pdfs"] += 1
         rel_key = pdf_path.relative_to(pdf_dir).with_suffix("").as_posix()
         metadata = analyze_pdf_text(
@@ -709,39 +712,17 @@ def suppress_stderr_fd() -> Iterator[None]:
 
 def classify_pdf_text_result(result: Dict[str, Any]) -> None:
     evidence = result.get("digital_origin_evidence") if isinstance(result.get("digital_origin_evidence"), dict) else {}
-    if result.get("status") == "error":
-        pdf_text_class = "error"
-        needs_ocr = True
-    elif result.get("recovered_text"):
-        pdf_text_class = "digital_text_recovered"
-        needs_ocr = False
-    elif result.get("text_extractable"):
-        pdf_text_class = "text_extractable"
-        needs_ocr = False
-    elif evidence.get("has_digital_evidence"):
-        pdf_text_class = "digital_text_unrecovered"
-        needs_ocr = True
-    elif evidence.get("has_images"):
-        pdf_text_class = "image_or_scanned"
-        needs_ocr = True
-    else:
-        pdf_text_class = "unknown_unextractable"
-        needs_ocr = True
-    result["pdf_text_class"] = pdf_text_class
-    result["needs_ocr"] = needs_ocr
-
-
-def iter_pdf_paths(pdf_dir: Path) -> Iterator[Path]:
-    if not pdf_dir.exists():
-        return iter(())
-    return (path for path in sorted(pdf_dir.rglob("*.pdf")) if path.is_file())
-
-
-def limited(paths: Iterable[Path], limit: int | None) -> Iterator[Path]:
-    for index, path in enumerate(paths):
-        if limit is not None and index >= limit:
-            break
-        yield path
+    decision = classify_pdf_text_metadata(
+        PdfTextSignals(
+            status_error=result.get("status") == "error",
+            recovered_text=bool(result.get("recovered_text")),
+            text_extractable=bool(result.get("text_extractable")),
+            has_digital_evidence=bool(evidence.get("has_digital_evidence")),
+            has_images=bool(evidence.get("has_images")),
+        )
+    )
+    result["pdf_text_class"] = decision.pdf_text_class
+    result["needs_ocr"] = decision.needs_ocr
 
 
 def normalize_text(text: str) -> str:
