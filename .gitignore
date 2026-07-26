@@ -25,3 +25,10 @@ __pycache__/
 *.pyc
 sync_work/
 .venv/
+.omo/
+.agy/
+.vibe/
+wiki_vault/
+uv.lock
+docs/metadata_duckdb_motherduck.md
+docs/strix_halo_npu_review.md
