@@ -62,7 +62,7 @@ class FakePytesseract:
 
 
 def write_item(path: Path, pdf_path: Path, status: str = "completed") -> None:
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps({"id": path.stem, "pdf": {"status": status, "path": str(pdf_path)}}, ensure_ascii=False),
         encoding="utf-8",
@@ -212,3 +212,57 @@ def test_generate_source_extraction_peer_review_writes_sidecar_and_index(tmp_pat
     assert summary["images_saved"] == 1
     assert metadata["pdf_key"] == "2024/20240101/abc"
     assert index["2024/20240101/abc"]["best_text_method"] == "pdf_text"
+
+
+def test_generate_source_extraction_peer_review_resolves_repo_relative_paths_and_skips_unsafe_paths(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "artifacts"
+    safe_pdf = root / "searchThema" / "pdfs" / "2024" / "20240101" / "safe.pdf"
+    unsafe_target = tmp_path / "outside.pdf"
+    symlink_pdf = root / "searchThema" / "pdfs" / "2024" / "20240101" / "link.pdf"
+    unsafe_absolute = tmp_path / "absolute-outside.pdf"
+
+    safe_pdf.parent.mkdir(parents=True)
+    safe_pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    unsafe_target.write_bytes(b"%PDF-1.4\n%%EOF")
+    unsafe_absolute.write_bytes(b"%PDF-1.4\n%%EOF")
+    symlink_pdf.symlink_to(unsafe_target)
+
+    safe_item = root / "searchThema" / "metadata" / "items" / "2024" / "20240101" / "safe.json"
+    unsafe_absolute_item = root / "searchThema" / "metadata" / "items" / "2024" / "20240101" / "outside.json"
+    unsafe_symlink_item = root / "searchThema" / "metadata" / "items" / "2024" / "20240101" / "symlink.json"
+    write_item(unsafe_absolute_item, unsafe_absolute)
+    write_item(unsafe_symlink_item, symlink_pdf)
+    write_item(safe_item, Path("artifacts") / "searchThema" / "pdfs" / "2024" / "20240101" / "safe.pdf")
+
+    calls: list[Path] = []
+
+    def fake_analyze(pdf_path_arg, *, image_output_dir, **_kwargs):
+        calls.append(Path(pdf_path_arg))
+        image_output_dir.mkdir(parents=True)
+        image_path = image_output_dir / "page_001.png"
+        image_path.write_bytes(b"fake png")
+        return {
+            "status": "ok",
+            "generated_at": "2026-01-01T00:00:00",
+            "peers": {
+                "pdf_text": {"status": "ok", "text_chars": 5, "text_extractable": True},
+                "markitdown": {"status": "skipped", "text_chars": 0},
+                "image_ocr": {"status": "ok", "text_chars": 4, "images": [{"path": str(image_path)}]},
+            },
+            "review": {"best_text_method": "pdf_text", "peer_summaries": {}},
+            "decision": {"text_extractable": True, "preferred_text_source": "pdf_text", "needs_ocr": False},
+        }
+
+    monkeypatch.setattr(pdf_extraction_peer_review, "analyze_pdf_extraction_peer_review", fake_analyze)
+
+    summary = generate_source_extraction_peer_review("searchThema", artifacts_root=root, workers=1)
+
+    sidecar = root / "searchThema" / "extraction_peer_review" / "items" / "2024" / "20240101" / "safe.json"
+    metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    assert summary["eligible"] == 1
+    assert summary["processed"] == 1
+    assert summary["skipped_unsafe_pdf_path"] == 2
+    assert calls == [safe_pdf.resolve()]
+    assert metadata["resolved_pdf_path"] == str(safe_pdf.resolve())
+    assert metadata["pdf_path"] == "artifacts/searchThema/pdfs/2024/20240101/safe.pdf"

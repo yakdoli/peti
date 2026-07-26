@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
+from gwanbo_ocr.pdf.io import UnsafePathError, resolve_pdf_path
 from src.pdf_text_metadata import SOURCE_NAMES, analyze_pdf_text
 
 try:
@@ -384,6 +385,7 @@ def generate_source_extraction_peer_review(
         "skipped_existing": 0,
         "skipped_not_completed": 0,
         "skipped_missing_pdf_path": 0,
+        "skipped_unsafe_pdf_path": 0,
         "json_errors": 0,
         "errors": 0,
         "images_saved": 0,
@@ -427,13 +429,24 @@ def generate_source_extraction_peer_review(
             summary["skipped_missing_pdf_path"] += 1
             continue
 
+        try:
+            resolved_pdf_path = resolve_pdf_path(
+                {"pdf_path": pdf_path_text},
+                base_dir=artifacts_root.parent,
+                peti_root=artifacts_root.parent,
+                trusted_root=artifacts_root,
+            )
+        except UnsafePathError:
+            summary["skipped_unsafe_pdf_path"] += 1
+            continue
+
         summary["eligible"] += 1
         work_items.append(
             {
                 "source": source,
                 "rel_key": rel_key,
                 "item_path": str(item_path),
-                "pdf_path": str(resolve_path(pdf_path_text, artifacts_root)),
+                "pdf_path": str(resolved_pdf_path),
                 "pdf_path_text": pdf_path_text,
                 "sidecar_path": str(sidecar_path),
                 "image_output_dir": str(output_images_dir / rel_key),
@@ -537,9 +550,12 @@ def iter_item_paths(item_metadata_dir: Path) -> Iterator[Path]:
 
 
 def compact_index_metadata(metadata: Dict[str, Any], sidecar_path: Path, artifacts_root: Path) -> Dict[str, Any]:
-    review = metadata.get("review") if isinstance(metadata.get("review"), dict) else {}
-    peers = metadata.get("peers") if isinstance(metadata.get("peers"), dict) else {}
-    decision = metadata.get("decision") if isinstance(metadata.get("decision"), dict) else {}
+    review_raw = metadata.get("review")
+    peers_raw = metadata.get("peers")
+    decision_raw = metadata.get("decision")
+    review = review_raw if isinstance(review_raw, dict) else {}
+    peers = peers_raw if isinstance(peers_raw, dict) else {}
+    decision = decision_raw if isinstance(decision_raw, dict) else {}
     return {
         "status": metadata.get("status"),
         "source": metadata.get("source"),
